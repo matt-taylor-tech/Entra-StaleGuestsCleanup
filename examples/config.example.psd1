@@ -15,6 +15,13 @@
     # Days of inactivity before an account is disabled, and before it is deleted.
     # A guest that never signed in is aged from its creation date instead.
     # There is no correct pair of numbers. Write down whose decision these are.
+    #
+    # Whatever you choose, keep the gap between them at least twice your schedule
+    # interval, or a single missed run deletes accounts that were never disabled:
+    #
+    #     DeleteAfterDays - DisableAfterDays >= ScheduleIntervalDays * 2
+    #
+    # 90 and 120 with a 15-day schedule satisfies this. The deploy script checks it.
     DisableAfterDays = 90
     DeleteAfterDays  = 120
 

@@ -79,13 +79,11 @@ excluded partner domain cannot block every run.
 ## Quick start
 
 ```powershell
-# 1. Grant the managed identity read-only Graph roles first.
-./deploy/Grant-ManagedIdentityGraphRoles.ps1 -ManagedIdentityObjectId "<object-id>" -ReadOnly
+# 1. Grant the managed identity read-only Graph roles. It finds the identity itself.
+./deploy/Grant-ManagedIdentityGraphRoles.ps1 -ResourceGroupName "<rg>" -AutomationAccountName "<aa>" -ReadOnly
 
-# 2. Deploy the module and the runbook.
-./deploy/Deploy-StaleGuestCleanup.ps1 -Stage Modules -ResourceGroupName "<rg>" -AutomationAccountName "<aa>"
-./deploy/Deploy-StaleGuestCleanup.ps1 -Stage Runbook -ResourceGroupName "<rg>" -AutomationAccountName "<aa>"
-./deploy/Deploy-StaleGuestCleanup.ps1 -Stage Verify  -ResourceGroupName "<rg>" -AutomationAccountName "<aa>"
+# 2. Deploy. Imports the module, waits for it, publishes the runbook, checks everything.
+./deploy/Deploy-StaleGuestCleanup.ps1 -Stage All -ResourceGroupName "<rg>" -AutomationAccountName "<aa>"
 
 # 3. Run it once by hand, in report mode. Read the output.
 Start-AzAutomationRunbook -ResourceGroupName "<rg>" -AutomationAccountName "<aa>" `
@@ -95,6 +93,42 @@ Start-AzAutomationRunbook -ResourceGroupName "<rg>" -AutomationAccountName "<aa>
 Only after a report you are happy with: grant the two write roles by re-running the
 grant script without `-ReadOnly`, then set the schedule. Full walkthrough in
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+
+## Schedule and monitoring
+
+Both are set up by the same deploy script, and both are switched on last.
+
+```powershell
+# A failure alert, created switched OFF. Switch it on at cutover with -Stage AlertOn.
+./deploy/Deploy-StaleGuestCleanup.ps1 -Stage Alert -ResourceGroupName "<rg>" `
+    -AutomationAccountName "<aa>" -AlertEmail "<address>"
+
+# Runs every 15 days by default. Change it with -ScheduleIntervalDays.
+./deploy/Deploy-StaleGuestCleanup.ps1 -Stage Schedule -ResourceGroupName "<rg>" `
+    -AutomationAccountName "<aa>" -StartTime "2026-09-01 02:00"
+```
+
+The alert is a metric alert on the Automation Account's own `TotalJob` metric, filtered
+to this runbook and to failed jobs. It needs **no Log Analytics workspace, no diagnostic
+setting, and no query language**. The runbook throws on a failed account operation and on
+either abort condition, so all of those become a failed job and reach the alert.
+
+**Check your cadence against your thresholds.** The job is blind between runs, so:
+
+```text
+DeleteAfterDays - DisableAfterDays  >=  ScheduleIntervalDays * 2
+```
+
+An account is disabled at the first run that sees it past `DisableAfterDays`. If that one
+run is missed, the next sees the age plus another interval, which may already be past
+`DeleteAfterDays` — and the account is deleted having never been disabled. The gap needs
+room for two runs, so every account gets a second chance.
+
+The defaults satisfy this: the 90 to 120 day window is 30 days and runs are 15 days apart,
+so 30 >= 2 x 15. If you would rather run monthly, move delete out to match —
+`-ScheduleIntervalDays 30` with `DeleteAfterDays = 150`. The Schedule stage refuses a gap
+narrower than one interval, warns for anything under two, and prints both fixes with the
+numbers filled in.
 
 It also runs on a workstation, which is the easiest way to try it:
 

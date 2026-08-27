@@ -19,40 +19,61 @@
     These are the narrowest roles that do the job. User.ReadWrite.All and
     Directory.ReadWrite.All would both work and both grant far more than is needed.
 
+    Name the Automation Account and this script finds the managed identity itself. You
+    do not have to look up the object ID.
+
     Run this ONCE per environment, by hand, as an account that can grant app roles
     (Global Administrator or Privileged Role Administrator). It is not part of the job.
 
     Safe to run twice. A role that is already granted is reported and skipped.
 
-.PARAMETER ManagedIdentityObjectId
-    The Object (principal) ID of the Automation Account's managed identity.
-    Find it under: Automation Account > Identity > System assigned > Object (principal) ID.
+.PARAMETER ResourceGroupName
+    Resource group holding the Automation Account.
 
-    Note this is the Object ID, not the Application (client) ID. The two are not
-    interchangeable, and using the wrong one grants roles to something else.
+.PARAMETER AutomationAccountName
+    The Automation Account whose managed identity gets the roles. Its object ID is read
+    from the account, so there is nothing to copy by hand.
+
+.PARAMETER ManagedIdentityObjectId
+    Object (principal) ID of a managed identity, if you would rather name it directly.
+    Use this when the identity does not belong to an Automation Account, or when you
+    cannot sign in to Azure with Az but can sign in to Graph.
 
 .PARAMETER ReadOnly
-    Grant only the read roles. The job can then run in -Mode Report but cannot change
-    anything. Use this to prove the reporting before you allow enforcement.
+    Grant only the read roles. The job can then run in -Mode Report but physically cannot
+    change anything, whatever its parameters say. Use this first, prove the reporting,
+    then run again without it.
 
 .EXAMPLE
-    .\deploy\Grant-ManagedIdentityGraphRoles.ps1 -ManagedIdentityObjectId "00000000-1111-2222-3333-444444444444" -ReadOnly
+    .\deploy\Grant-ManagedIdentityGraphRoles.ps1 -ResourceGroupName "rg-automation" -AutomationAccountName "aa-identity" -ReadOnly
 
-    Grant the read roles first, so a report-only run can be proved safely.
+    The usual first step. Finds the managed identity and grants the four read roles.
+
+.EXAMPLE
+    .\deploy\Grant-ManagedIdentityGraphRoles.ps1 -ResourceGroupName "rg-automation" -AutomationAccountName "aa-identity"
+
+    Grants everything, including the two write roles. Only do this once a report looks right.
 
 .EXAMPLE
     .\deploy\Grant-ManagedIdentityGraphRoles.ps1 -ManagedIdentityObjectId "00000000-1111-2222-3333-444444444444"
 
-    Grant everything, including the two write roles.
+    Name the identity directly, for a host that is not an Automation Account.
 
 .NOTES
-    Requires: Microsoft.Graph.Applications module, and an interactive sign-in holding
+    Requires: Microsoft.Graph.Applications, and an interactive Graph sign-in holding
               AppRoleAssignment.ReadWrite.All and Application.Read.All.
+              Az.Accounts and Az.Automation as well, unless you pass the object ID.
 #>
 
-[CmdletBinding(SupportsShouldProcess)]
+[CmdletBinding(SupportsShouldProcess, DefaultParameterSetName = 'FromAutomationAccount')]
 param(
-    [Parameter(Mandatory = $true)]
+    [Parameter(Mandatory = $true, ParameterSetName = 'FromAutomationAccount')]
+    [string]$ResourceGroupName,
+
+    [Parameter(Mandatory = $true, ParameterSetName = 'FromAutomationAccount')]
+    [string]$AutomationAccountName,
+
+    [Parameter(Mandatory = $true, ParameterSetName = 'FromObjectId')]
     [string]$ManagedIdentityObjectId,
 
     [Parameter(Mandatory = $false)]
@@ -80,10 +101,42 @@ $writeRoles = @(
 
 $rolesToGrant = if ($ReadOnly) { $readRoles } else { $readRoles + $writeRoles }
 
+# ---------------------------------------------------------------------------------
+# Find the managed identity
+# ---------------------------------------------------------------------------------
+
+if ($PSCmdlet.ParameterSetName -eq 'FromAutomationAccount') {
+
+    Import-Module Az.Automation -ErrorAction Stop
+
+    if (-not (Get-AzContext -ErrorAction SilentlyContinue)) {
+        Write-Host 'Signing in to Azure to read the Automation Account...' -ForegroundColor Cyan
+        Connect-AzAccount | Out-Null
+    }
+
+    $account = Get-AzAutomationAccount -ResourceGroupName $ResourceGroupName -Name $AutomationAccountName -ErrorAction Stop
+
+    $ManagedIdentityObjectId = $account.Identity.PrincipalId
+
+    if (-not $ManagedIdentityObjectId) {
+        throw "The Automation Account $AutomationAccountName has no system-assigned managed identity. Turn it on first: Automation Account > Identity > System assigned > On. Then run this again."
+    }
+
+    Write-Host "Automation Account: $AutomationAccountName" -ForegroundColor DarkGray
+    Write-Host "Managed identity:   $ManagedIdentityObjectId (read from the account)" -ForegroundColor DarkGray
+    Write-Host ''
+}
+
+# ---------------------------------------------------------------------------------
+# Grant the roles
+# ---------------------------------------------------------------------------------
+
 Import-Module Microsoft.Graph.Applications -ErrorAction Stop
 
-Write-Host 'Connecting to Microsoft Graph (interactive)...' -ForegroundColor Cyan
-Connect-MgGraph -Scopes 'AppRoleAssignment.ReadWrite.All', 'Application.Read.All' -NoWelcome
+if (-not (Get-MgContext -ErrorAction SilentlyContinue)) {
+    Write-Host 'Connecting to Microsoft Graph (interactive)...' -ForegroundColor Cyan
+    Connect-MgGraph -Scopes 'AppRoleAssignment.ReadWrite.All', 'Application.Read.All' -NoWelcome
+}
 
 $graphSp = Get-MgServicePrincipal -Filter "appId eq '$graphAppId'"
 if (-not $graphSp) {
@@ -91,13 +144,13 @@ if (-not $graphSp) {
 }
 
 # Confirm the target really is a service principal before granting anything to it. A
-# mistyped ID, or the Application ID used instead of the Object ID, fails here rather
+# mistyped ID, or an Application ID used where an Object ID belongs, fails here rather
 # than silently granting roles to the wrong principal.
 try {
     $targetSp = Get-MgServicePrincipal -ServicePrincipalId $ManagedIdentityObjectId -ErrorAction Stop
 }
 catch {
-    throw "No service principal found with object ID $ManagedIdentityObjectId. Check that you used the Object (principal) ID from the Automation Account's Identity blade, not the Application (client) ID."
+    throw "No service principal found with object ID $ManagedIdentityObjectId. If you passed it by hand, check you used the Object (principal) ID from the Automation Account's Identity blade, not the Application (client) ID."
 }
 
 Write-Host "Target identity:  $($targetSp.DisplayName)  ($ManagedIdentityObjectId)" -ForegroundColor Yellow
@@ -152,8 +205,6 @@ Write-Host 'first run reports no sign-in data, wait and run it again before chan
 
 if ($ReadOnly) {
     Write-Host ''
-    Write-Host 'The write roles were not granted. Run this again without -ReadOnly when you are' -ForegroundColor Yellow
-    Write-Host 'ready to let the job disable and delete accounts.' -ForegroundColor Yellow
+    Write-Host 'The write roles were not granted, so the job cannot change an account yet.' -ForegroundColor Yellow
+    Write-Host 'Run this again without -ReadOnly when a report looks right.' -ForegroundColor Yellow
 }
-
-Disconnect-MgGraph | Out-Null
