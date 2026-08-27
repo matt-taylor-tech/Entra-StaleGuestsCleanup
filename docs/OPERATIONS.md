@@ -1,0 +1,156 @@
+# Operations
+
+Day-to-day running of the stale guest cleanup job.
+
+## What it does on each run
+
+1. Reads every guest account in the tenant, with its sign-in activity.
+2. Checks that the sign-in data is usable at all. If no guest in a sizeable directory has
+   a sign-in date, it aborts.
+3. Works out how long each guest has been inactive.
+4. Applies the exclusions.
+5. Decides: delete, disable, or leave alone.
+6. Stops if the candidate count is above the abort ceiling.
+7. Applies the per-run caps, most stale accounts first.
+8. Acts, unless the mode is `Report`.
+9. Writes the report.
+
+The job holds no state between runs. Everything is recomputed from Entra each time, so a
+missed run or a double run causes no drift.
+
+## Reading a report
+
+The summary block gives the shape of the run:
+
+```text
+Mode:               Enforce
+Thresholds:         disable at 90 days, delete at 120 days
+Guests read:        1840
+Excluded:           41
+Disable candidates: 12  (applied 12, deferred 0)
+Delete candidates:  380 (applied 50, deferred 330)
+Failures:           0
+```
+
+Then one row per account. The columns worth reading:
+
+| Column | What to look for |
+| --- | --- |
+| `Basis` | `LastSignIn` means the guest signed in at least once. `NeverSignedIn` means the clock ran from the creation date. `Indeterminate` means there was not enough data and the account was left alone |
+| `InactiveDays` | How the decision was reached. Cross-check it against `LastActivityDate` |
+| `Action` | What was decided |
+| `Outcome` | What actually happened. `Deleted`, `Disabled`, `Report only, not applied`, `Deferred by the per-run cap`, `Aborted`, `Skipped by WhatIf`, or a failure message |
+| `Memberships` | Groups and Teams the account belonged to. Read before the delete, because afterwards there is nothing to read. This is the record of what access was removed |
+| `Reason` | Why. Includes the exclusion reason when an account was skipped |
+
+`Outcome` and `Action` are separate on purpose. `Action` is what the rules decided;
+`Outcome` is what the run actually did. A row saying `Delete` / `Deferred by the per-run
+cap` has not been deleted.
+
+## Normal things that are not faults
+
+**Large deferred counts on early runs.** Expected on a directory that has never been
+cleaned. The caps are doing their job. Each run drains 50, oldest first.
+
+**A guest with `Basis = NeverSignedIn` and a recent creation date.** Correct. It is an
+invitation nobody accepted yet, and it is not old enough to act on.
+
+**`Memberships: none` on a deleted account.** Common. Most stale guests were invited for
+a single shared file and never joined a group.
+
+## Things that need attention
+
+### The run aborted with "not one of N guests has a recorded sign-in"
+
+The guard fired. `signInActivity` came back null for every guest, which means the data is
+missing, not that every guest is stale. Without the guard the whole directory would have
+become a delete candidate.
+
+Almost always one of:
+
+- `AuditLog.Read.All` was removed from the managed identity, or never propagated.
+- A tenant-wide Graph problem.
+
+Fix the permission, then re-run in report mode. **No account was changed.**
+
+### The run aborted with "above the ceiling"
+
+More candidates than `AbortIfCandidatesExceed`. Nothing was changed.
+
+Check, in this order:
+
+1. Were the thresholds changed by mistake? A `DisableAfterDays` of 9 instead of 90 does
+   exactly this.
+2. Did an exclusion disappear? A deleted exclusion group, or a variable that got cleared,
+   puts everything it protected back on the list.
+3. Is it genuine? On a first enforcing run against an old directory, it usually is.
+
+If it is genuine, raise the ceiling deliberately and leave the per-run caps low. Do not
+raise the ceiling to make an unexplained number go away.
+
+### Failures on individual accounts
+
+The run finishes the other accounts, then fails at the end so the alert fires. Each
+failure is in the report with the Graph error.
+
+Common causes:
+
+- **`Insufficient privileges`** — the account holds a directory role the job cannot touch,
+  or a write role is missing from the managed identity.
+- **`Request_ResourceNotFound`** — somebody deleted the account between the read and the
+  write. Harmless.
+- **Throttling** — Graph returned 429. Re-run; the job is idempotent.
+
+## Recovering a deleted account
+
+Entra keeps a deleted user restorable for **30 days**.
+
+Entra admin centre > Users > Deleted users > select > Restore. Or:
+
+```powershell
+Restore-MgDirectoryDeletedItem -DirectoryObjectId "<object-id>"
+```
+
+Restoring brings the account back with its group memberships. It does **not** restore
+sharing links that were tied to the identity, so check the access the run report recorded
+for that account.
+
+After 30 days the account is gone and the run report is the only record it existed. That
+is the reason the `Blob` report sink exists: Azure Automation prunes job history, and job
+history is not an audit trail.
+
+If a restored account is still stale, it will be a candidate again on the next run. Put it
+in the exclusion group.
+
+## Routine changes
+
+**Change the thresholds.** Re-register the schedule with new `-RunbookParameters`. Run
+once in report mode at the new numbers first, to see what changed.
+
+**Add an exception.** Add the account to the exclusion group. No redeployment, no
+developer. This is why the exclusion is a group.
+
+**Raise the caps.** Only after several clean runs. Every raise makes the next mistake
+bigger.
+
+**Pause everything.** Disable the schedule:
+
+```powershell
+Set-AzAutomationSchedule -ResourceGroupName "<rg>" -AutomationAccountName "<aa>" `
+    -Name "StaleGuestCleanup-Weekly" -IsEnabled $false
+```
+
+**Stop it changing anything, permanently.** Remove the two write app roles from the
+managed identity. Then no parameter can make it act.
+
+## Reviewing it
+
+Worth doing once a quarter:
+
+- Read one full report end to end, not just the summary.
+- Check the exclusion group still reflects reality. Exclusions get added and never
+  removed.
+- Check the deferred count is falling. If it is not, the caps are lower than the rate new
+  accounts go stale.
+- Confirm the thresholds still match whatever written rule they came from. If there is no
+  written rule, that is the thing to fix.

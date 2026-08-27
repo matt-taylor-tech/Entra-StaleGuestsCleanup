@@ -1,0 +1,32 @@
+# Secrets and local configuration. Never commit any of these.
+.env
+.env.*
+*.env
+config.local.psd1
+config.psd1
+appsettings.local.json
+*.pfx
+*.cer
+*.key
+*.pem
+secrets.json
+
+# Run output. A stale guest report holds real names and email addresses, so it is
+# Protected Information and must stay out of the repo.
+*.csv
+*.xlsx
+Output/
+output/
+reports/
+TestResults/
+testResults.xml
+coverage.xml
+
+# PowerShell and editor noise
+*.ps1xml.bak
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store
