@@ -1,22 +1,22 @@
 # Deployment
 
-Deploy in stages, in this order. Read the output of each stage before starting the next.
-The risky stages are last on purpose.
+Everything runs in Azure. There is no pipeline and no build step: two scripts put the
+runbook into an Automation Account and set up its schedule and alerting.
 
-Nothing in this job changes an account until step 8. Up to that point every run is
-report-only, whatever else is configured.
+Nothing changes an account until step 5. Up to that point the managed identity holds
+read-only Graph roles, so the job physically cannot disable or delete anything, whatever
+its parameters say.
 
 ## What you need first
 
 - An Azure Automation Account with a **system-assigned managed identity** turned on
-  (Automation Account > Identity > System assigned > On). Note the **Object (principal)
-  ID**. It is not the same as the Application (client) ID, and the two are not
-  interchangeable.
+  (Automation Account > Identity > System assigned > On). You do not need to note the
+  object ID — the scripts read it from the account.
 - A sign-in with **Contributor** on the Automation Account, for the deployment.
 - A sign-in that can grant app roles — **Global Administrator** or **Privileged Role
-  Administrator** — for the permissions step. This is usually a different person.
-- `Az.Accounts`, `Az.Automation`, and `Microsoft.Graph.Applications` on the machine you
-  deploy from.
+  Administrator** — for step 1. Usually a different person.
+- `Az.Accounts`, `Az.Automation`, `Az.Monitor`, and `Microsoft.Graph.Applications` on the
+  machine you deploy from.
 
 Build and test against a development tenant first, not the tenant you care about.
 
@@ -24,130 +24,119 @@ Build and test against a development tenant first, not the tenant you care about
 
 ```powershell
 Connect-AzAccount
-./deploy/Grant-ManagedIdentityGraphRoles.ps1 -ManagedIdentityObjectId "<object-id>" -ReadOnly
+./deploy/Grant-ManagedIdentityGraphRoles.ps1 `
+    -ResourceGroupName "<rg>" -AutomationAccountName "<aa>" -ReadOnly
 ```
 
-`-ReadOnly` grants the four read roles and none of the write roles. The job can then
-report but physically cannot change an account, whatever mode it is put in. That is a
-better first position than trusting a parameter default.
+Name the Automation Account and the script finds its managed identity itself.
 
-The script checks that the object ID really is a service principal before granting
-anything, so a mistyped ID fails here rather than granting roles to something else.
+`-ReadOnly` grants the four read roles and neither write role. That is a better first
+position than trusting a parameter default: the job can report, and cannot act.
+
+If the account has no managed identity the script says so and stops. If you would rather
+name an identity directly — for a host that is not an Automation Account — pass
+`-ManagedIdentityObjectId` instead.
 
 Grants take a few minutes to reach the Automation sandbox.
 
-## 2. Import the module
+## 2. Deploy
 
 ```powershell
-./deploy/Deploy-StaleGuestCleanup.ps1 -Stage Modules `
+./deploy/Deploy-StaleGuestCleanup.ps1 -Stage All `
     -ResourceGroupName "<rg>" -AutomationAccountName "<aa>"
 ```
 
-`Microsoft.Graph.Authentication` is the only module the job needs. Everything else goes
-through `Invoke-MgGraphRequest`, which keeps the number of module versions to hold in
-step down to one.
+One command. It imports `Microsoft.Graph.Authentication`, waits for the import to
+finish, publishes the runbook, then checks the module, the runbook, the managed identity,
+and every Graph role by name.
+
+Module import takes several minutes, and the stage waits rather than making you poll.
+
+Expect the two write roles to be reported as not granted. That is correct at this point.
 
 Add `-IncludeAzModules` only if you intend to use the `Blob` report sink.
 
-Module import runs in the background and takes several minutes. Re-run this stage until
-everything reports `Succeeded`.
+`All` deliberately excludes the schedule and the alert. Neither is a thing to switch on
+without reading a report first.
 
-If your Automation Account only offers PowerShell 5.1, 7.1, or 7.2, create a **runtime
-environment** on PowerShell 7.4 and assign the runbook to it. The job needs 7.2 as a
-minimum.
+> If your Automation Account only offers PowerShell 5.1, 7.1, or 7.2, create a **runtime
+> environment** on PowerShell 7.4 and assign the runbook to it. The job needs 7.2 as a
+> minimum.
 
-## 3. Publish the runbook
-
-```powershell
-./deploy/Deploy-StaleGuestCleanup.ps1 -Stage Runbook `
-    -ResourceGroupName "<rg>" -AutomationAccountName "<aa>"
-```
-
-The runbook is published but has no schedule, so it runs only when you start it.
-
-## 4. Verify
-
-```powershell
-./deploy/Deploy-StaleGuestCleanup.ps1 -Stage Verify `
-    -ResourceGroupName "<rg>" -AutomationAccountName "<aa>"
-```
-
-This checks the module, the runbook, the managed identity, and each Graph role by name.
-The role check is the one that matters: everything else can be right and the job still
-cannot read a sign-in date.
-
-Expect the two write roles to be reported missing at this point. That is correct — you
-granted read-only in step 1.
-
-## 5. First run, in report mode
+## 3. First run, in report mode
 
 ```powershell
 Start-AzAutomationRunbook -ResourceGroupName "<rg>" -AutomationAccountName "<aa>" `
     -Name "Invoke-StaleGuestCleanup" -Parameters @{ Mode = 'Report' }
 ```
 
-Then read the job output. Check, in this order:
+Read the job output. Check, in this order:
 
 1. **Does the log say some guests have a recorded sign-in?** The line reads
    `N of M guests have a recorded sign-in`. If N is 0 the job aborts, and the cause is
    almost always that `AuditLog.Read.All` has not propagated yet. Wait and run again.
-2. **How many candidates are there?** On a directory that has never been cleaned this
-   can be thousands, because invitations that were never accepted are aged from their
-   creation date.
+2. **How many candidates are there?** On a directory that has never been cleaned this can
+   be thousands, because invitations nobody accepted are aged from their creation date.
 3. **Read the list.** Look for anyone who must not be removed: a customer contact, a
-   supplier, an account that belongs to a live project.
+   supplier, an account tied to a live project.
 
-## 6. Set up the exclusions
+## 4. Set up the exclusions
 
-Create a group, put the accounts that must never be touched into it, and pass its object
-ID. Use a group rather than a parameter list, so adding an exception later needs no
-redeployment and no developer.
+Create a group, put the accounts that must never be touched into it, and store its object
+ID as an Automation variable. The runbook reads that variable on its own.
 
 ```powershell
 New-AzAutomationVariable -ResourceGroupName "<rg>" -AutomationAccountName "<aa>" `
     -Name "StaleGuest-ExcludeGroupId" -Value "<group-object-id>" -Encrypted $false
 ```
 
-The runbook reads that variable on its own. For whole domains, use `-ExcludeDomains`.
+Use a group rather than a parameter list, so adding an exception later needs no
+redeployment and no developer. For whole domains, use `-ExcludeDomains`.
 
-Re-run step 5 and confirm the excluded accounts have dropped off the candidate list.
+Re-run step 3 and confirm the excluded accounts have dropped off the candidate list.
 
-## 7. Set up failure alerting
+## 5. Grant the write permissions
+
+Only when a report looks right.
+
+```powershell
+./deploy/Grant-ManagedIdentityGraphRoles.ps1 `
+    -ResourceGroupName "<rg>" -AutomationAccountName "<aa>"
+```
+
+Same command as step 1, without `-ReadOnly`. This adds
+`User.EnableDisableAccount.All` and `User.DeleteRestore.All`. From here the mode
+parameter is what stands between a report and a deletion.
+
+Prove it once with `-WhatIf` before the first enforcing run.
+
+## 6. Set up failure alerting
 
 ```powershell
 ./deploy/Deploy-StaleGuestCleanup.ps1 -Stage Alert `
     -ResourceGroupName "<rg>" -AutomationAccountName "<aa>" -AlertEmail "<address>"
 ```
 
-The alert is built **switched off**. A failed test run is a failed job, so an alert left
-on during testing mails the address on every attempt.
+This creates an action group and a metric alert on the Automation Account's own
+`TotalJob` metric, filtered to this runbook and to failed jobs. **No Log Analytics
+workspace, no diagnostic setting, and no query language** — the Automation Account emits
+that metric on its own.
 
-This needs a diagnostic setting on the Automation Account sending `JobLogs` to a Log
-Analytics workspace. Turn the alert on at cutover:
+The alert is created **switched off**. A failed test run is a failed job, so an alert left
+on during testing mails the address on every attempt. Switch it on at cutover:
 
 ```powershell
 ./deploy/Deploy-StaleGuestCleanup.ps1 -Stage AlertOn `
     -ResourceGroupName "<rg>" -AutomationAccountName "<aa>"
 ```
 
-## 8. Grant the write permissions
+The runbook throws on any account operation that fails, and on either abort condition, so
+all of those become a failed job and reach this alert.
 
-Only when the reports look right.
+## 7. Schedule it
 
-```powershell
-./deploy/Deploy-StaleGuestCleanup.ps1 -Stage Verify -ResourceGroupName "<rg>" -AutomationAccountName "<aa>"
-./deploy/Grant-ManagedIdentityGraphRoles.ps1 -ManagedIdentityObjectId "<object-id>"
-```
-
-This adds `User.EnableDisableAccount.All` and `User.DeleteRestore.All`. From here the job
-can change accounts, so the mode parameter becomes the thing standing between a report
-and a deletion.
-
-Prove it once with `-WhatIf` before the first enforcing run.
-
-## 9. Schedule it
-
-Start in report mode, so the schedule itself is proved before it can change anything:
+Runs every 15 days by default, which is what the 90 and 120 day thresholds need. Start in
+report mode, so the schedule itself is proved before it can change anything:
 
 ```powershell
 ./deploy/Deploy-StaleGuestCleanup.ps1 -Stage Schedule `
@@ -156,30 +145,89 @@ Start in report mode, so the schedule itself is proved before it can change anyt
 ```
 
 `-StartTime` is passed in rather than calculated, so re-running the stage does not
-silently move the schedule. Azure Automation requires it to be at least five minutes in
-the future.
+silently move the schedule. Azure Automation needs it at least five minutes ahead.
 
-Let one cycle run. Then switch to enforcement, with the caps low:
+Change the cadence with `-ScheduleIntervalDays`.
+
+### Check the cadence against the thresholds
+
+This one catches people out, and the Schedule stage checks it for you.
+
+The job is blind between runs. It only sees an account at the moment it runs. So the
+question is always: when the job wakes up, what number does it see?
+
+An account is disabled at the first run that sees it at `DisableAfterDays` or more. That
+run sees an age anywhere in a window one interval wide. **If that run is the one that goes
+missing**, the next run sees the same age plus another interval — which may already be
+past `DeleteAfterDays`. The account is then deleted having never been disabled, because
+delete is checked before disable.
+
+So the gap needs room for two runs, not one:
+
+```text
+DeleteAfterDays - DisableAfterDays  >=  ScheduleIntervalDays * 2
+```
+
+The shipped defaults satisfy the rule: a 90 to 120 day window is 30 days, and runs are 15
+days apart, so 30 >= 2 x 15. Every account gets two chances to be disabled.
+
+Move to a 30-day schedule without changing the thresholds and the gap becomes one interval
+instead of two, which breaks it. Nudging the delete threshold up a little does not fix
+that. On a 30-day schedule:
+
+| Delete at | Gap | If one run is missed |
+| --- | --- | --- |
+| 120 | 30 | ~100% of accounts skip disable |
+| 125 | 35 | ~83% skip disable |
+| 135 | 45 | ~50% skip disable |
+| 150 | 60 | none — rule satisfied |
+
+So if you do want a 30-day cadence, move the delete threshold out to match:
+`-ScheduleIntervalDays 30 -RunbookParameters @{ DeleteAfterDays = 150 }`. Gap 60 = 2 x 30.
+
+The default goes the other way on purpose. Running fortnightly keeps the 90 and 120 day
+thresholds people actually asked for, and clears a backlog twice as fast. A run with
+nothing to do finishes quietly, so the extra run costs little.
+
+What the stage does:
+
+- **Gap narrower than one interval:** refuses to run. Some accounts would skip the disable
+  stage even with no run missed.
+- **Gap narrower than two intervals:** warns, prints the share of accounts exposed to a
+  missed run, and gives both fixes with the numbers filled in.
+- **Gap at or above two intervals:** confirms it is fine.
+
+Set either with `-RunbookParameters` and `-ScheduleIntervalDays`.
+
+### Then switch to enforcement
+
+Let one cycle run in report mode. Then:
 
 ```powershell
 ./deploy/Deploy-StaleGuestCleanup.ps1 -Stage Schedule `
     -ResourceGroupName "<rg>" -AutomationAccountName "<aa>" `
-    -StartTime "2026-09-08 02:00" `
-    -RunbookParameters @{ Mode = 'Enforce'; MaxDisablesPerRun = 50; MaxDeletesPerRun = 50 }
+    -StartTime "2026-10-01 02:00" `
+    -RunbookParameters @{ Mode = 'Enforce'; DeleteAfterDays = 150; MaxDeletesPerRun = 50 }
 ```
 
 The Schedule stage refuses to schedule enforcement if the runbook has never completed a
 run in that Automation Account. The whole rollout depends on somebody having read a
-report first, so that check is deliberate.
+report, so that check is deliberate.
 
-## 10. Drain the backlog
+## 8. Draining a backlog
 
-With the caps at 50, a backlog of two thousand accounts takes about ten weeks of weekly
-runs. That is the point: each run is small enough to notice if it is wrong.
+Do the arithmetic before you trust the schedule to clear a backlog.
 
-Watch the first few runs, then raise the caps if the reports stay clean. Every run logs
-how many candidates were deferred, so the report never reads as "everything handled" when
-it was not.
+At 50 deletes per run every 30 days, the job removes about **600 accounts a year**. A
+backlog of two thousand takes over three years. The Schedule stage prints this figure so
+it is not a surprise.
+
+If that is too slow, **start the runbook by hand between scheduled runs** to work through
+the backlog. Each manual run is still capped, still reports, and still needs someone to
+look at it. That is better than raising the cap, which removes the safety net permanently
+to solve a one-off problem.
+
+Once the backlog is clear, the steady-state volume is small and 50 per run is generous.
 
 ## Local testing
 
@@ -190,7 +238,7 @@ Connect-MgGraph -Scopes "User.Read.All","AuditLog.Read.All","GroupMember.Read.Al
 ./src/Invoke-StaleGuestCleanup.ps1 -Mode Report
 ```
 
-A guest you create today is zero days old, so a live tenant cannot exercise the 90 or 120
+A guest you create today is zero days old, so no live tenant can exercise the 90 or 120
 day boundary. To prove the behaviour end to end, use small thresholds against test
 accounts:
 
@@ -206,12 +254,14 @@ Invoke-Pester -Path ./tests
 
 ## Rollback
 
-- **Disable the schedule.** `Set-AzAutomationSchedule -IsEnabled $false`. Nothing runs
-  until it is re-enabled.
+- **Stop the schedule.** `Set-AzAutomationSchedule -IsEnabled $false`. Nothing runs until
+  it is re-enabled.
 - **Back to report-only.** Re-register the schedule with `Mode = 'Report'`.
 - **Take the write permissions away.** Remove the two write app role assignments from the
-  managed identity. The job then cannot change anything regardless of its parameters.
+  managed identity. The job then cannot change anything regardless of its parameters, and
+  does not depend on anyone remembering which mode the schedule is in. This is the best
+  emergency stop.
 - **Restore a deleted account.** Entra keeps a deleted user restorable for **30 days**:
-  Entra admin centre > Users > Deleted users > Restore. After 30 days it is gone. The run
-  report is then the only record of what the account had access to, which is why the
-  memberships are read before the delete.
+  Entra admin centre > Users > Deleted users > Restore. After 30 days it is gone, and the
+  run report is the only record of what the account had access to. That is why memberships
+  are read before the delete.

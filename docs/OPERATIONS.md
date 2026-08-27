@@ -122,6 +122,47 @@ history is not an audit trail.
 If a restored account is still stale, it will be a candidate again on the next run. Put it
 in the exclusion group.
 
+## Monitoring
+
+A metric alert on the Automation Account watches the `TotalJob` metric for a failed job
+on this runbook, and emails the address given at deployment. It needs no Log Analytics
+workspace and no diagnostic setting.
+
+The runbook throws, and so produces a failed job, when:
+
+- an account operation fails,
+- the sign-in data is unusable,
+- the candidate count is above the abort ceiling.
+
+So all three reach the alert. A run that finds nothing to do completes quietly.
+
+### What the alert does not catch
+
+A failure alert only fires when a job runs and fails. It cannot tell you that **no job ran
+at all** — a disabled schedule, an expired schedule, or a deleted link produces silence,
+not a failure.
+
+Nothing in Azure reports that cleanly without more moving parts than it is worth here. The
+practical check is to look at the run history now and then:
+
+```powershell
+Get-AzAutomationJob -ResourceGroupName "<rg>" -AutomationAccountName "<aa>" `
+    -RunbookName "Invoke-StaleGuestCleanup" |
+    Sort-Object LastModifiedTime -Descending |
+    Select-Object -First 5 JobId, Status, StartTime, EndTime
+```
+
+If the newest run is older than your interval plus a few days, the schedule has stopped.
+Confirm it with:
+
+```powershell
+Get-AzAutomationSchedule -ResourceGroupName "<rg>" -AutomationAccountName "<aa>" |
+    Select-Object Name, IsEnabled, NextRun, ExpiryTime
+```
+
+Worth adding to whatever quarterly review already exists, rather than building a second
+alert for it.
+
 ## Routine changes
 
 **Change the thresholds.** Re-register the schedule with new `-RunbookParameters`. Run

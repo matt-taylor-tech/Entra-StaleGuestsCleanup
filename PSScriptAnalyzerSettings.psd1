@@ -25,6 +25,19 @@
         # Also reported against the New-* test fixtures, which build hashtables.
         'PSUseShouldProcessForStateChangingFunctions'
 
+        # Reported against the stage functions in Deploy-StaleGuestCleanup.ps1, which
+        # call $PSCmdlet.ShouldProcess without declaring SupportsShouldProcess of their
+        # own. They deliberately use the script's $PSCmdlet, so one -WhatIf on the script
+        # covers every stage. PowerShell resolves $PSCmdlet up the scope chain, so this
+        # works: running the script with -WhatIf prints the "What if:" lines and skips the
+        # action inside the nested function. Verified, not assumed.
+        'PSShouldProcess'
+
+        # Reported against the script parameters that are only read inside those same
+        # stage functions. The analyzer does not follow a parameter into a nested
+        # function, so it reads them as unused. They are all used.
+        'PSReviewUnusedParameter'
+
         # Reported against Write-Log. PSScriptAnalyzer carries a list of cmdlet names
         # taken from a PowerShell 6.1 Windows build that included a Write-Log. No such
         # cmdlet exists in PowerShell 7, and there is no real collision. The name also
