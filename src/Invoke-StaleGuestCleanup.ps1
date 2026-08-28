@@ -38,6 +38,8 @@ Safety:         Defaults to -Mode Report, which changes nothing. Enforcement mus
 =============================================================================================
 #>
 
+#Requires -Version 7.2
+
 [CmdletBinding(SupportsShouldProcess)]
 param(
     # ----- Thresholds -------------------------------------------------------------------
@@ -169,6 +171,10 @@ function Get-AutomationVariableSafe {
 
 #endregion
 
+# Most accounts the JobLog sink lists individually. Beyond this it reports the count and
+# points at the Blob sink, because Azure Automation caps the size of an output record.
+$script:JobLogRowLimit = 500
+
 #region Pure logic - no Graph calls, covered by tests/StaleGuestLogic.Tests.ps1
 
 function ConvertTo-NullableUtc {
@@ -220,11 +226,19 @@ function Get-GraphProperty {
     param($Source, [string]$Name)
 
     if ($null -eq $Source) { return $null }
+
     if ($Source -is [System.Collections.IDictionary]) {
-        if ($Source.Contains($Name)) { return $Source[$Name] }
-        return $null
+        # Index rather than call .Contains(). Invoke-MgGraphRequest returns a Hashtable at
+        # the top level, but a nested object such as signInActivity can arrive as a
+        # Dictionary[string,object], and .Contains() throws "cannot find an overload" on
+        # that type even after a cast to IDictionary. Indexing returns $null for a missing
+        # key on both types, so it is both simpler and the only shape-safe option.
+        return $Source[$Name]
     }
-    return $Source.PSObject.Properties[$Name].Value
+
+    $property = $Source.PSObject.Properties[$Name]
+    if ($null -eq $property) { return $null }
+    return $property.Value
 }
 
 function ConvertTo-GuestRecord {
@@ -480,6 +494,50 @@ function Connect-GraphApi {
     }
 }
 
+function Invoke-GraphWithRetry {
+    <#
+        Runs a Graph call and retries it if Graph throttles or is briefly unavailable.
+
+        A run can make a hundred or more write calls, and Graph throttles writes to /users.
+        Without this a single 429 would fail one account, fail the job, and send a
+        needless alert. Retry-After is honoured when Graph sends it, because Graph's own
+        number is better than a guess.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [scriptblock]$Action,
+
+        [Parameter(Mandatory = $false)]
+        [string]$Description = 'Graph call',
+
+        [Parameter(Mandatory = $false)]
+        [int]$MaxAttempts = 4
+    )
+
+    for ($attempt = 1; ; $attempt++) {
+        try {
+            return & $Action
+        }
+        catch {
+            $status = $null
+            try { $status = [int]$_.Exception.Response.StatusCode } catch { $status = $null }
+
+            $throttled = ($status -in @(429, 503, 504)) -or
+                         ($_.Exception.Message -match '(?i)429|too\s*many\s*requests|throttl|service unavailable')
+
+            if (-not $throttled -or $attempt -ge $MaxAttempts) { throw }
+
+            # Graph's own Retry-After if present, otherwise back off.
+            $wait = 0
+            try { $wait = [int]$_.Exception.Response.Headers.RetryAfter.Delta.TotalSeconds } catch { $wait = 0 }
+            if ($wait -le 0) { $wait = [int][math]::Min(60, [math]::Pow(2, $attempt) * 5) }
+
+            Write-Log "$Description was throttled or unavailable (attempt $attempt of $MaxAttempts). Waiting $wait seconds." -Level WARNING
+            Start-Sleep -Seconds $wait
+        }
+    }
+}
+
 function Invoke-GraphGetAll {
     <#
         Pages through a Graph collection and returns every item.
@@ -514,7 +572,7 @@ function Invoke-GraphGetAll {
         }
         if ($Headers) { $params['Headers'] = $Headers }
 
-        $response = Invoke-MgGraphRequest @params
+        $response = Invoke-GraphWithRetry -Description "GET page $page" -Action { Invoke-MgGraphRequest @params }
 
         if ($response.value) {
             foreach ($item in $response.value) { $results.Add($item) }
@@ -553,10 +611,10 @@ function Get-GuestUser {
         'creationType'
     ) -join ','
 
-    $uri = "https://graph.microsoft.com/v1.0/users?`$filter=userType eq 'Guest'&`$select=$select&`$count=true"
+    $uri = "https://graph.microsoft.com/v1.0/users?`$filter=userType eq 'Guest'&`$select=$select"
 
     Write-Log 'Reading guest accounts from Entra ID...'
-    $guests = Invoke-GraphGetAll -Uri $uri -Headers @{ ConsistencyLevel = 'eventual' } -Activity 'Guest read'
+    $guests = Invoke-GraphGetAll -Uri $uri -Activity 'Guest read'
     Write-Log "Read $($guests.Count) guest accounts." -Level SUCCESS
 
     return $guests
@@ -653,10 +711,12 @@ function Disable-GuestAccount {
         [string]$UserId
     )
 
-    Invoke-MgGraphRequest -Method PATCH `
-        -Uri "https://graph.microsoft.com/v1.0/users/$UserId" `
-        -Body @{ accountEnabled = $false } `
-        -ErrorAction Stop | Out-Null
+    Invoke-GraphWithRetry -Description "Disable $UserId" -Action {
+        Invoke-MgGraphRequest -Method PATCH `
+            -Uri "https://graph.microsoft.com/v1.0/users/$UserId" `
+            -Body @{ accountEnabled = $false } `
+            -ErrorAction Stop
+    } | Out-Null
 }
 
 function Remove-GuestAccount {
@@ -665,9 +725,11 @@ function Remove-GuestAccount {
         [string]$UserId
     )
 
-    Invoke-MgGraphRequest -Method DELETE `
-        -Uri "https://graph.microsoft.com/v1.0/users/$UserId" `
-        -ErrorAction Stop | Out-Null
+    Invoke-GraphWithRetry -Description "Delete $UserId" -Action {
+        Invoke-MgGraphRequest -Method DELETE `
+            -Uri "https://graph.microsoft.com/v1.0/users/$UserId" `
+            -ErrorAction Stop
+    } | Out-Null
 }
 
 #endregion
@@ -741,13 +803,40 @@ function Write-ReportToJobLog {
         return
     }
 
-    # Table rather than CSV here, because a person reads the job log.
-    $actioned |
-        Sort-Object -Property @{ Expression = 'Action'; Descending = $true }, @{ Expression = 'InactiveDays'; Descending = $true } |
-        Select-Object UserPrincipalName, CompanyName, Basis, InactiveDays, Action, Outcome |
-        Format-Table -AutoSize |
-        Out-String -Width 4096 |
-        ForEach-Object { Write-Output $_ }
+    # One line per account, not a Format-Table block.
+    #
+    # The first report-only run against a directory that has never been cleaned can have
+    # thousands of candidates. A single formatted table would be one enormous output
+    # record, and Azure Automation caps the size of a record, so the report would be
+    # truncated exactly when it is most needed. Separate lines each stay small.
+    $ordered = $actioned |
+        Sort-Object -Property @{ Expression = 'Action'; Descending = $true }, @{ Expression = 'InactiveDays'; Descending = $true }
+
+    $shown = [math]::Min($actioned.Count, $script:JobLogRowLimit)
+
+    Write-Log "Accounts that met a threshold: $($actioned.Count). Listing $shown."
+    Write-Output 'Action,InactiveDays,Basis,Outcome,Company,UserPrincipalName'
+
+    $i = 0
+    foreach ($row in $ordered) {
+        if ($i -ge $shown) { break }
+        $i++
+
+        # Quote the two free-text fields, so a comma in a company name cannot shift columns.
+        Write-Output ('{0},{1},{2},"{3}","{4}",{5}' -f
+            $row.Action,
+            $row.InactiveDays,
+            $row.Basis,
+            ($row.Outcome -replace '"', "'"),
+            ($row.CompanyName -replace '"', "'"),
+            $row.UserPrincipalName)
+    }
+
+    if ($actioned.Count -gt $shown) {
+        $remaining = $actioned.Count - $shown
+        Write-Log "$remaining more accounts are not listed above, ordered least stale first." -Level WARNING
+        Write-Log 'The job log is not the place for a list this long. Add Blob to -ReportSink for the full CSV, which is also the audit trail that outlives the job history.' -Level WARNING
+    }
 }
 
 function Write-ReportToBlob {

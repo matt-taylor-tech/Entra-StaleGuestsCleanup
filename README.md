@@ -1,5 +1,13 @@
 # Entra stale guest cleanup
 
+> [!WARNING]
+> **This tool deletes user accounts.** Read the code before you point it at a directory
+> you care about. It defaults to report-only and will not change anything until you both
+> grant it write permissions and ask for enforcement, but the end state of a normal
+> deployment is a scheduled job that deletes guest accounts on its own.
+>
+> A deleted Entra user is restorable for 30 days. After that it is gone.
+
 An Azure Automation runbook that finds dormant Microsoft Entra ID guest accounts,
 disables them after one threshold, and deletes them after a second, longer one.
 
@@ -211,11 +219,26 @@ the abort ceiling, the null-data guard, and the report-only gate.
 
 ## Requirements
 
-- PowerShell 7.2 or later
-- `Microsoft.Graph.Authentication` — the only required module
-- `Az.Accounts` and `Az.Storage` — only for the `Blob` report sink
-- An Azure Automation Account with a managed identity, or any host that can sign in to
-  Graph
+- **PowerShell 7.2 or later.** Windows, macOS, or Linux. In Azure Automation the runbook
+  must be type `PowerShell72`, not `PowerShell` — that name means Windows PowerShell 5.1,
+  where the Graph module will not load. The deploy script handles this and `Verify`
+  checks it.
+- `Microsoft.Graph.Authentication` — the only module the job itself needs.
+- `Az.Accounts`, `Az.Automation`, `Az.Monitor` — on the machine you deploy from. Both the
+  pre-5.0 and current Az.Monitor action group cmdlets are supported.
+- `Az.Storage` — only for the `Blob` report sink.
+- An Azure Automation Account with a system-assigned managed identity, or any host that
+  can sign in to Graph.
+- Entra ID licensing: none beyond what `signInActivity` needs, which is included in
+  Entra ID P1 and above.
+
+**Cost:** Azure Automation includes 500 free job minutes per month. A run over a few
+thousand guests takes minutes, so a fortnightly schedule normally costs nothing. The
+optional `Blob` sink adds a few pence of storage.
+
+**Scale:** tested against a directory of roughly three thousand guests. The job reads the
+full guest list into memory, which is fine at that size. A directory with hundreds of
+thousands of guests would want the read reworked.
 
 ## Licence
 

@@ -19,7 +19,7 @@
 #>
 
 BeforeAll {
-    $script:RunbookPath = Join-Path $PSScriptRoot '..\src\Invoke-StaleGuestCleanup.ps1'
+    $script:RunbookPath = Join-Path $PSScriptRoot '..' 'src' 'Invoke-StaleGuestCleanup.ps1'
     . $script:RunbookPath
 
     # Fixed reference time, so no test depends on the day it runs.
@@ -318,6 +318,62 @@ Describe 'Get-ExclusionReason' {
 
     It 'does not exclude an unrelated domain' {
         Get-ExclusionReason -Record $script:Record -ExcludeDomains @('other.com') | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Get-GraphProperty' {
+
+    It 'reads a property from a Hashtable, which is what the top level of a Graph reply is' {
+        Get-GraphProperty @{ id = 'abc' } 'id' | Should -Be 'abc'
+    }
+
+    It 'reads a property from a generic dictionary, which is what a nested Graph object can be' {
+        # signInActivity arrives nested. The SDK can materialise it as
+        # Dictionary[string,object] rather than Hashtable, and .Contains() throws on that
+        # type even after a cast to IDictionary. If this regresses, the job throws for
+        # every guest and the whole run dies.
+        $dict = [System.Collections.Generic.Dictionary[string, object]]::new()
+        $dict['lastSignInDateTime'] = '2026-01-01T00:00:00Z'
+
+        Get-GraphProperty $dict 'lastSignInDateTime' | Should -Be '2026-01-01T00:00:00Z'
+    }
+
+    It 'returns null for a missing key on either dictionary type, rather than throwing' {
+        $dict = [System.Collections.Generic.Dictionary[string, object]]::new()
+
+        Get-GraphProperty @{ id = 'abc' } 'nope' | Should -BeNullOrEmpty
+        Get-GraphProperty $dict 'nope'           | Should -BeNullOrEmpty
+    }
+
+    It 'returns null for a missing property on an object, rather than throwing' {
+        Get-GraphProperty ([pscustomobject]@{ id = 'abc' }) 'nope' | Should -BeNullOrEmpty
+    }
+
+    It 'returns null when the source itself is null' {
+        Get-GraphProperty $null 'anything' | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'ConvertTo-GuestRecord with a generic dictionary from the SDK' {
+
+    It 'flattens a guest whose signInActivity is a generic dictionary' {
+        $activity = [System.Collections.Generic.Dictionary[string, object]]::new()
+        $activity['lastSignInDateTime'] = '2026-02-01T00:00:00Z'
+        $activity['lastNonInteractiveSignInDateTime'] = '2026-05-01T00:00:00Z'
+
+        $guest = [System.Collections.Generic.Dictionary[string, object]]::new()
+        $guest['id'] = 'dict-1'
+        $guest['userPrincipalName'] = 'd@example.com'
+        $guest['accountEnabled'] = $true
+        $guest['signInActivity'] = $activity
+
+        $record = ConvertTo-GuestRecord $guest
+        $record.Id | Should -Be 'dict-1'
+        $record.LastNonInteractiveSignIn.Month | Should -Be 5
+
+        # And the non-interactive date must still win.
+        $activityResult = Get-GuestLastActivity -Record $record -AsOfUtc ([datetime]::new(2026, 6, 1, 0, 0, 0, [System.DateTimeKind]::Utc))
+        $activityResult.InactiveDays | Should -Be 31
     }
 }
 

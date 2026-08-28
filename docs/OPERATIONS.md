@@ -32,7 +32,20 @@ Delete candidates:  380 (applied 50, deferred 330)
 Failures:           0
 ```
 
-Then one row per account. The columns worth reading:
+Then one line per account, as comma-separated values with a header:
+
+```text
+Action,InactiveDays,Basis,Outcome,Company,UserPrincipalName
+Delete,412,NeverSignedIn,"Report only, not applied","Partner Co",someone@partner.com
+```
+
+Separate lines rather than a formatted table, because Azure Automation caps the size of a
+single output record and a first run can have thousands of candidates. For the same reason
+the job log lists at most **500 accounts**, most stale first, and then says how many it
+left out. Add `Blob` to `-ReportSink` when you need the full list, which is also the audit
+trail that outlives the job history.
+
+The columns worth reading:
 
 | Column | What to look for |
 | --- | --- |
@@ -57,6 +70,11 @@ invitation nobody accepted yet, and it is not old enough to act on.
 
 **`Memberships: none` on a deleted account.** Common. Most stale guests were invited for
 a single shared file and never joined a group.
+
+**A warning that a call was throttled, followed by a wait.** Normal. Graph limits writes
+to `/users`, and the job waits and retries up to four times, honouring Graph's own
+Retry-After when it sends one. Only a call that still fails after those attempts is
+reported as a failure.
 
 ## Things that need attention
 
@@ -178,7 +196,7 @@ bigger.
 
 ```powershell
 Set-AzAutomationSchedule -ResourceGroupName "<rg>" -AutomationAccountName "<aa>" `
-    -Name "StaleGuestCleanup-Weekly" -IsEnabled $false
+    -Name "StaleGuestCleanup-Fortnightly" -IsEnabled $false
 ```
 
 **Stop it changing anything, permanently.** Remove the two write app roles from the
