@@ -23,7 +23,7 @@
 #>
 
 BeforeAll {
-    . (Join-Path $PSScriptRoot '..\src\Invoke-StaleGuestCleanup.ps1')
+    . (Join-Path $PSScriptRoot '..' 'src' 'Invoke-StaleGuestCleanup.ps1')
 
     function New-GuestFixture {
         <# A guest as Graph would return it, aged a given number of days. #>
@@ -127,11 +127,11 @@ Describe 'Invoke-StaleGuestCleanup orchestration' {
 
         It 'is the default when no mode is given' {
             # Guards against a future edit that makes Enforce the fallback.
-            $scriptParams = (Get-Command (Join-Path $PSScriptRoot '..\src\Invoke-StaleGuestCleanup.ps1')).Parameters
+            $scriptParams = (Get-Command (Join-Path $PSScriptRoot '..' 'src' 'Invoke-StaleGuestCleanup.ps1')).Parameters
             $scriptParams['Mode'].Attributes.Where({ $_ -is [System.Management.Automation.ValidateSetAttribute] }).ValidValues |
                 Should -Contain 'Report'
 
-            $content = Get-Content (Join-Path $PSScriptRoot '..\src\Invoke-StaleGuestCleanup.ps1') -Raw
+            $content = Get-Content (Join-Path $PSScriptRoot '..' 'src' 'Invoke-StaleGuestCleanup.ps1') -Raw
             $content | Should -Match "\`$Mode\s*=\s*'Report'"
         }
     }

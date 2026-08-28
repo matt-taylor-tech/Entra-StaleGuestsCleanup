@@ -59,9 +59,17 @@ Add `-IncludeAzModules` only if you intend to use the `Blob` report sink.
 `All` deliberately excludes the schedule and the alert. Neither is a thing to switch on
 without reading a report first.
 
-> If your Automation Account only offers PowerShell 5.1, 7.1, or 7.2, create a **runtime
-> environment** on PowerShell 7.4 and assign the runbook to it. The job needs 7.2 as a
-> minimum.
+### About the runbook runtime
+
+The runbook is imported as type **`PowerShell72`**. This matters: in Azure Automation the
+type named `PowerShell` is Windows PowerShell **5.1**, where a current
+`Microsoft.Graph.Authentication` will not load. A 5.1 runbook imports and publishes
+without complaint, then fails on its first Graph call in a way that reads like a missing
+module. The `Verify` stage checks the type and says so plainly.
+
+If your Automation Account uses **runtime environments**, assign a PowerShell 7.4
+environment to the runbook in the portal after step 2. The `Az.Automation` module has no
+parameter for that, so it cannot be scripted here.
 
 ## 3. First run, in report mode
 

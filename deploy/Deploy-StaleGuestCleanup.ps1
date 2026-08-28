@@ -39,6 +39,17 @@
 .PARAMETER RunbookName
     Name for the runbook inside the Automation Account.
 
+.PARAMETER RunbookType
+    Azure Automation runbook type. Defaults to PowerShell72.
+
+    Note that the type named "PowerShell" is Windows PowerShell 5.1, not 7.x. A runbook
+    imported as that type publishes without complaint and then fails on the first call
+    that needs a current Microsoft.Graph.Authentication. The Verify stage checks this.
+
+    If your Automation Account uses runtime environments, assign a PowerShell 7.4
+    environment to the runbook in the portal. The Az.Automation module has no parameter
+    for that.
+
 .PARAMETER ScheduleName
     Name for the schedule created by the Schedule stage.
 
@@ -104,6 +115,13 @@ param(
     [Parameter(Mandatory = $false)]
     [string]$RunbookName = 'Invoke-StaleGuestCleanup',
 
+    # PowerShell72, not PowerShell. In Azure Automation the type named "PowerShell" means
+    # Windows PowerShell 5.1, where a current Microsoft.Graph.Authentication will not even
+    # load. The job needs 7.2 or later. Only override this to diagnose something.
+    [Parameter(Mandatory = $false)]
+    [ValidateSet('PowerShell72', 'PowerShell')]
+    [string]$RunbookType = 'PowerShell72',
+
     [Parameter(Mandatory = $false)]
     [string]$ScheduleName = 'StaleGuestCleanup-Fortnightly',
 
@@ -129,7 +147,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$runbookFile     = Join-Path $PSScriptRoot '..\src\Invoke-StaleGuestCleanup.ps1'
+$runbookFile     = Join-Path $PSScriptRoot '..' 'src' 'Invoke-StaleGuestCleanup.ps1'
 $alertName       = "$RunbookName-JobFailed"
 $actionGroupName = "$RunbookName-Alert"
 
@@ -229,15 +247,19 @@ function Invoke-RunbookStage {
 
     if (-not $PSCmdlet.ShouldProcess($RunbookName, 'Import and publish the runbook')) { return }
 
-    Write-Stage "  [+] Importing $RunbookName..."
+    Write-Stage "  [+] Importing $RunbookName as type $RunbookType..."
     Import-AzAutomationRunbook @common `
         -Path $runbookFile `
         -Name $RunbookName `
-        -Type PowerShell `
+        -Type $RunbookType `
         -Force | Out-Null
 
     Publish-AzAutomationRunbook @common -Name $RunbookName | Out-Null
     Write-Stage "  [+] Published $RunbookName." 'Green'
+
+    if ($RunbookType -eq 'PowerShell') {
+        Write-Stage '  [!] Type PowerShell is Windows PowerShell 5.1. The job needs 7.2 or later.' 'Red'
+    }
 }
 
 function Invoke-VerifyStage {
@@ -257,6 +279,19 @@ function Invoke-VerifyStage {
     }
     else {
         $problems.Add("Runbook $RunbookName is missing or unpublished. Run -Stage Runbook.")
+    }
+
+    # Check the runtime, not just that the runbook is there. A runbook on 5.1 imports and
+    # publishes perfectly and then fails on the first line that needs the Graph module,
+    # which reads like a module problem and is not.
+    if ($runbook) {
+        $type = [string]$runbook.RunbookType
+        if ($type -match '72|7\.') {
+            Write-Stage "  [ok] Runbook type $type" 'Green'
+        }
+        else {
+            $problems.Add("Runbook $RunbookName has type '$type', which is Windows PowerShell 5.1. The job needs 7.2 or later. Re-run -Stage Runbook, which now imports as PowerShell72. If this Automation Account uses runtime environments, assign a PowerShell 7.4 environment to the runbook in the portal, because the Az.Automation module cannot set one.")
+        }
     }
 
     $identityId = $account.Identity.PrincipalId
