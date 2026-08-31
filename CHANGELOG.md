@@ -5,6 +5,19 @@ All notable changes to this project are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **The Alert stage could not create the metric alert.** Az.Monitor renamed a parameter
+  on `New-AzMetricAlertRuleV2DimensionSelection` at version 5: `-ValueOnly` became
+  `-ValuesToInclude`, and current versions do not accept the old name at all. The stage
+  failed with "A parameter cannot be found that matches parameter name 'ValueOnly'"
+  after it had already created the action group, so a first deployment stopped before
+  Verify ran. The parameter name is now read off the installed cmdlet, the same way the
+  action group cmdlets already were.
+
+
 ## [1.2.0] - 2026-08-28
 
 A line-by-line review of both scripts, with the order of operations checked. Nine of the
