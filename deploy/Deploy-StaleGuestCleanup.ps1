@@ -486,8 +486,17 @@ function Set-JobFailureAlert {
         [Parameter(Mandatory = $false)] [switch]$Enabled
     )
 
-    $statusDim  = New-AzMetricAlertRuleV2DimensionSelection -DimensionName 'Status'  -ValueOnly 'Failed'
-    $runbookDim = New-AzMetricAlertRuleV2DimensionSelection -DimensionName 'Runbook' -ValueOnly $RunbookName
+    # Az.Monitor renamed this parameter too: -ValueOnly before version 5,
+    # -ValuesToInclude from version 5 on. Read the name off the installed cmdlet, the same
+    # way the action group cmdlets above are handled, so both versions work.
+    $dimensionCmd = Get-Command New-AzMetricAlertRuleV2DimensionSelection -ErrorAction Stop
+    $valueParam = if ($dimensionCmd.Parameters.ContainsKey('ValuesToInclude')) { 'ValuesToInclude' } else { 'ValueOnly' }
+
+    $statusArgs  = @{ DimensionName = 'Status';  $valueParam = @('Failed') }
+    $runbookArgs = @{ DimensionName = 'Runbook'; $valueParam = @($RunbookName) }
+
+    $statusDim  = New-AzMetricAlertRuleV2DimensionSelection @statusArgs
+    $runbookDim = New-AzMetricAlertRuleV2DimensionSelection @runbookArgs
 
     $criteria = New-AzMetricAlertRuleV2Criteria `
         -MetricName 'TotalJob' `
