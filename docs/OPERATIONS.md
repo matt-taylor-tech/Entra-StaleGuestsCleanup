@@ -41,9 +41,18 @@ Delete,412,NeverSignedIn,"Report only, not applied","Partner Co",someone@partner
 
 Separate lines rather than a formatted table, because Azure Automation caps the size of a
 single output record and a first run can have thousands of candidates. For the same reason
-the job log lists at most **500 accounts**, most stale first, and then says how many it
-left out. Add `Blob` to `-ReportSink` when you need the full list, which is also the audit
-trail that outlives the job history.
+the job log lists at most **500 accounts** and then says how many it left out. Add `Blob`
+to `-ReportSink` when you need the full list, which is also the audit trail that outlives
+the job history.
+
+Disables and deletes get separate shares of that 500, and disables go first. A single
+combined list put every delete ahead of every disable, so on a large backlog the handful
+of disabled accounts never appeared — and those are the ones most likely to produce a
+"I have lost access" call.
+
+In **report mode every actionable row reads `Report only, not applied`**, including rows
+beyond the per-run cap. Nothing was attempted, so nothing was deferred. Instead the log
+states how many runs the current caps would need to clear what it found.
 
 The columns worth reading:
 
@@ -145,6 +154,11 @@ in the exclusion group.
 A metric alert on the Automation Account watches the `TotalJob` metric for a failed job
 on this runbook, and emails the address given at deployment. It needs no Log Analytics
 workspace and no diagnostic setting.
+
+This is not optional in practice. `-Stage Verify` reports a missing alert as a problem,
+and `-Stage Schedule` refuses to schedule enforcement unless the alert exists and is
+switched on. Nobody reads Automation job history for pleasure, so a failed run has to
+reach a person.
 
 The runbook throws, and so produces a failed job, when:
 

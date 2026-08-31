@@ -10,16 +10,17 @@
 
         Modules    Import Microsoft.Graph.Authentication, then wait for it to finish.
         Runbook    Import the runbook and publish it.
-        Verify     Check the module, the runbook, the managed identity, and each Graph
-                   role by name.
+        Alert      Create the job failure alert, switched OFF. Only when -AlertEmail is
+                   given; otherwise All says loudly that alerting is missing.
+        Verify     Check the module, the runbook, the managed identity, each Graph role
+                   by name, the failure alert, and the last run status.
 
-    The two stages that change how the job behaves are deliberately not in All, and have
-    to be asked for one at a time:
+    The two stages that change how the job behaves have to be asked for one at a time:
 
-        Alert      Create the job failure alert, switched OFF.
-        AlertOn    Switch that alert on. Do this at cutover.
+        AlertOn    Switch the failure alert on. Do this at cutover.
         Schedule   Turn the recurring run on. DO THIS LAST, and only after a manual run
-                   in -Mode Report looks right.
+                   in -Mode Report looks right. Scheduling enforcement refuses to proceed
+                   unless a failure alert exists and is switched on.
 
     Every stage is safe to run twice. If a thing already exists, the stage says so and
     moves on.
@@ -84,6 +85,13 @@
 .PARAMETER IncludeAzModules
     Also import Az.Accounts and Az.Storage. Only needed for the Blob report sink.
 
+.PARAMETER SkipAlertCheck
+    Let the Schedule stage enable enforcement without a failure alert in place.
+
+    By default it refuses. A job that deletes accounts on a schedule with nobody watching
+    for failed runs is the situation that check exists to prevent. Use this only where
+    failed Automation jobs already reach somebody by another route.
+
 .EXAMPLE
     .\deploy\Deploy-StaleGuestCleanup.ps1 -Stage All -ResourceGroupName "rg-automation" -AutomationAccountName "aa-identity"
 
@@ -142,7 +150,12 @@ param(
     [string]$AlertEmail,
 
     [Parameter(Mandatory = $false)]
-    [switch]$IncludeAzModules
+    [switch]$IncludeAzModules,
+
+    # Allow the Schedule stage to enable enforcement without a failure alert in place.
+    # Only for a tenant where failed runs already reach somebody another way.
+    [Parameter(Mandatory = $false)]
+    [switch]$SkipAlertCheck
 )
 
 $ErrorActionPreference = 'Stop'
@@ -178,6 +191,17 @@ $common = @{
     AutomationAccountName = $AutomationAccountName
 }
 
+# Azure Automation keeps a separate module space for each runtime, and the module
+# cmdlets default to the 5.1 one. A PowerShell72 runbook cannot see a module imported
+# into the 5.1 space. Without this the import succeeds, Verify reports the module as
+# present, and the runbook then fails on its first Graph call saying the module is
+# missing. Import into the space the runbook actually reads.
+$moduleCommon = $common.Clone()
+if ($RunbookType -eq 'PowerShell72') {
+    $moduleCommon['RuntimeVersion'] = '7.2'
+}
+$runtimeLabel = if ($moduleCommon.ContainsKey('RuntimeVersion')) { $moduleCommon['RuntimeVersion'] } else { '5.1' }
+
 # ---------------------------------------------------------------------------------
 # Stage bodies, as functions so the All stage can call them in order
 # ---------------------------------------------------------------------------------
@@ -192,7 +216,7 @@ function Invoke-ModulesStage {
     if ($IncludeAzModules) { $modules += @('Az.Accounts', 'Az.Storage') }
 
     foreach ($module in $modules) {
-        $existing = Get-AzAutomationModule @common -Name $module -ErrorAction SilentlyContinue
+        $existing = Get-AzAutomationModule @moduleCommon -Name $module -ErrorAction SilentlyContinue
 
         if ($existing -and $existing.ProvisioningState -eq 'Succeeded') {
             Write-Stage "  [=] $module already imported, version $($existing.Version)." 'DarkGray'
@@ -202,7 +226,7 @@ function Invoke-ModulesStage {
         if (-not $PSCmdlet.ShouldProcess($AutomationAccountName, "Import module $module")) { continue }
 
         Write-Stage "  [+] Importing $module from the PowerShell Gallery..."
-        New-AzAutomationModule @common `
+        New-AzAutomationModule @moduleCommon `
             -Name $module `
             -ContentLinkUri "https://www.powershellgallery.com/api/v2/package/$module" | Out-Null
     }
@@ -214,6 +238,13 @@ function Invoke-ModulesStage {
         return
     }
 
+    # Nothing was imported under -WhatIf, so waiting for it would spin for the full
+    # timeout and then throw, which looks like a fault rather than a dry run.
+    if ($WhatIfPreference) {
+        Write-Stage '  [i] -WhatIf: skipping the wait, because no import was started.' 'DarkGray'
+        return
+    }
+
     # Import is asynchronous. Poll, so the All stage does not run Verify against a module
     # that has not finished importing and report a false problem.
     $deadline = (Get-Date).AddMinutes(20)
@@ -221,7 +252,7 @@ function Invoke-ModulesStage {
         Write-Stage "  [.] Waiting for $module to finish importing..." 'DarkGray'
 
         while ((Get-Date) -lt $deadline) {
-            $state = (Get-AzAutomationModule @common -Name $module -ErrorAction SilentlyContinue).ProvisioningState
+            $state = (Get-AzAutomationModule @moduleCommon -Name $module -ErrorAction SilentlyContinue).ProvisioningState
 
             if ($state -eq 'Succeeded') {
                 Write-Stage "  [+] $module imported." 'Green'
@@ -233,7 +264,7 @@ function Invoke-ModulesStage {
             Start-Sleep -Seconds 20
         }
 
-        $final = (Get-AzAutomationModule @common -Name $module -ErrorAction SilentlyContinue).ProvisioningState
+        $final = (Get-AzAutomationModule @moduleCommon -Name $module -ErrorAction SilentlyContinue).ProvisioningState
         if ($final -ne 'Succeeded') {
             throw "Import of $module did not finish within 20 minutes. It is still running. Re-run -Stage Modules to check on it."
         }
@@ -265,12 +296,14 @@ function Invoke-RunbookStage {
 function Invoke-VerifyStage {
     $problems = [System.Collections.Generic.List[string]]::new()
 
-    $graphModule = Get-AzAutomationModule @common -Name 'Microsoft.Graph.Authentication' -ErrorAction SilentlyContinue
+    $graphModule = Get-AzAutomationModule @moduleCommon -Name 'Microsoft.Graph.Authentication' -ErrorAction SilentlyContinue
     if ($graphModule -and $graphModule.ProvisioningState -eq 'Succeeded') {
         Write-Stage "  [ok] Microsoft.Graph.Authentication $($graphModule.Version)" 'Green'
     }
     else {
-        $problems.Add('Microsoft.Graph.Authentication is missing or did not import. Run -Stage Modules.')
+        $problems.Add("Microsoft.Graph.Authentication is missing or did not import into the " +
+            "$runtimeLabel module space, which is the one a $RunbookType runbook reads. " +
+            'Run -Stage Modules.')
     }
 
     $runbook = Get-AzAutomationRunbook @common -Name $RunbookName -ErrorAction SilentlyContinue
@@ -286,7 +319,9 @@ function Invoke-VerifyStage {
     # which reads like a module problem and is not.
     if ($runbook) {
         $type = [string]$runbook.RunbookType
-        if ($type -match '72|7\.') {
+        # Any PowerShell 7 type, not just 72. Azure adds runtime versions over time, and
+        # the earlier pattern reported a perfectly good PowerShell74 runbook as 5.1.
+        if ($type -match '^(?i)PowerShell7') {
             Write-Stage "  [ok] Runbook type $type" 'Green'
         }
         else {
@@ -343,6 +378,38 @@ function Invoke-VerifyStage {
             Write-Warning "Could not check the Graph role grants: $($_.Exception.Message)"
             Write-Warning 'Re-run the grant script, which is safe to repeat, or check under Enterprise applications.'
         }
+    }
+
+    # Failure alerting. A job that deletes accounts on a schedule with nobody watching for
+    # failures is the thing this check exists to prevent.
+    try {
+        Import-Module Az.Monitor -ErrorAction Stop
+        $rule = Get-AzMetricAlertRuleV2 -ResourceGroupName $ResourceGroupName -Name $alertName -ErrorAction SilentlyContinue
+
+        if (-not $rule) {
+            $problems.Add("No failure alert named $alertName exists, so a failed run would go unnoticed. Run -Stage Alert with -AlertEmail.")
+        }
+        elseif (-not $rule.Enabled) {
+            Write-Stage "  [i]  Failure alert $alertName exists but is switched OFF." 'Yellow'
+            Write-Stage '       Correct while you are still testing. Run -Stage AlertOn before the schedule goes live.' 'DarkGray'
+        }
+        else {
+            Write-Stage "  [ok] Failure alert $alertName is on." 'Green'
+        }
+    }
+    catch {
+        Write-Warning "Could not check the failure alert: $($_.Exception.Message)"
+    }
+
+    # Last run status, so Verify answers "is this thing actually working".
+    $lastJob = Get-AzAutomationJob @common -RunbookName $RunbookName -ErrorAction SilentlyContinue |
+        Sort-Object LastModifiedTime -Descending | Select-Object -First 1
+    if ($lastJob) {
+        $colour = if ($lastJob.Status -eq 'Completed') { 'Green' } else { 'Yellow' }
+        Write-Stage "  [i]  Last run: $($lastJob.Status) at $($lastJob.StartTime)." $colour
+    }
+    else {
+        Write-Stage '  [i]  The runbook has never run. Start one by hand in -Mode Report next.' 'DarkGray'
     }
 
     Write-Host ''
@@ -546,6 +613,32 @@ function Invoke-ScheduleStage {
             throw "This would schedule enforcement, but $RunbookName has never completed a run in this Automation Account. Start a manual run in -Mode Report, read the report, then come back to this stage."
         }
         Write-Stage "  [i] $($completed.Count) completed run(s) found. Scheduling enforcement." 'Yellow'
+
+        # A scheduled job that deletes accounts must not run unwatched. Nobody reads
+        # Automation job history for fun, so a failed run has to reach a person.
+        if (-not $SkipAlertCheck) {
+            try {
+                Import-Module Az.Monitor -ErrorAction Stop
+                $rule = Get-AzMetricAlertRuleV2 -ResourceGroupName $ResourceGroupName -Name $alertName -ErrorAction SilentlyContinue
+
+                if (-not $rule) {
+                    throw "This would schedule the job to delete accounts, but no failure alert named $alertName exists, so a failed run would go unnoticed. Run -Stage Alert with -AlertEmail, then -Stage AlertOn. Pass -SkipAlertCheck only if failures reach you another way."
+                }
+                if (-not $rule.Enabled) {
+                    throw "The failure alert $alertName exists but is switched off, so a failed run would go unnoticed. Run -Stage AlertOn. Pass -SkipAlertCheck only if failures reach you another way."
+                }
+                Write-Stage "  [i] Failure alert $alertName is on." 'Green'
+            }
+            catch [System.Management.Automation.RuntimeException] {
+                throw
+            }
+            catch {
+                throw "Could not confirm that a failure alert is in place, and this would schedule account deletion. Error: $($_.Exception.Message). Pass -SkipAlertCheck to go ahead anyway."
+            }
+        }
+        else {
+            Write-Stage '  [!] -SkipAlertCheck: scheduling enforcement without confirming a failure alert.' 'Red'
+        }
     }
 
     $existing = Get-AzAutomationSchedule @common -Name $ScheduleName -ErrorAction SilentlyContinue
@@ -601,6 +694,19 @@ switch ($Stage) {
         Write-Stage '=== Runbook ===' 'Cyan'
         Invoke-RunbookStage
         Write-Host ''
+
+        if ($AlertEmail) {
+            Write-Stage '=== Alert ===' 'Cyan'
+            Invoke-AlertStage
+            Write-Host ''
+        }
+        else {
+            Write-Stage '=== Alert ===' 'Cyan'
+            Write-Stage '  [!] No -AlertEmail given, so no failure alert was created.' 'Yellow'
+            Write-Stage '      A scheduled job that deletes accounts needs somebody watching for failed runs.' 'Yellow'
+            Write-Stage '      Re-run: -Stage Alert -AlertEmail "<address>"' 'Yellow'
+            Write-Host ''
+        }
 
         Write-Stage '=== Verify ===' 'Cyan'
         $ok = Invoke-VerifyStage

@@ -5,6 +5,83 @@ All notable changes to this project are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-08-28
+
+A line-by-line review of both scripts, with the order of operations checked. Nine of the
+findings were confirmed by running code rather than by reading it.
+
+### Fixed
+
+- **The module went into the wrong runtime space.** Azure Automation keeps a separate
+  module space per runtime. The module cmdlets default to the 5.1 space, while a
+  `PowerShell72` runbook reads the 7.2 space. The import succeeded, Verify reported the
+  module present, and the runbook then failed at `Connect-MgGraph` saying it was missing.
+  Module operations now pass `-RuntimeVersion` to match the runbook type.
+- **Report mode claimed accounts had been deferred.** The per-run caps were applied
+  whatever the mode, so a report-only run labelled rows beyond the cap
+  "Deferred by the per-run cap" and reported a non-zero deferred count, in a run where
+  nothing was attempted. The caps now apply only when the job acts. A report run labels
+  every actionable row `Report only, not applied` and states instead how many runs the
+  current caps would need to clear the backlog.
+- **Disables could be missing from the job log.** Rows were sorted by action, and
+  "Delete" sorts after "Disable", so every delete came first and the 500-row limit was
+  spent before any disable was printed. On a large backlog the disabled accounts, which
+  are the ones most likely to produce a support call, never appeared. Disables and
+  deletes now get separate shares of the limit, and disables go first.
+- **Verify rejected a valid PowerShell 7.4 runbook.** The runtime test matched `72` or
+  `7.`, so a `PowerShell74` runbook was reported as Windows PowerShell 5.1 — while the
+  deployment guide tells you to assign a 7.4 runtime environment. It now accepts any
+  PowerShell 7 type.
+- **`-WhatIf` on `-Stage All` sat in the module wait loop for twenty minutes** and then
+  threw, because nothing had been imported for it to wait for. The wait is skipped under
+  `-WhatIf`.
+- **The retry wrapper relied on dynamic scope.** It took a scriptblock that splatted a
+  hashtable belonging to the calling function, which resolved only because the caller
+  happened to sit in the scope chain. Called from anywhere else the splat silently
+  produced an empty hashtable and the request went out with no method and no URI, raising
+  no error. It now takes the method, URI, body and headers as parameters. This path had
+  no test coverage at all; `tests/GraphRetry.Tests.ps1` now covers it.
+- **Excluded domains did not cover subdomains.** A rule for `partner.com` left
+  `someone@eu.partner.com` unprotected. For an exclusion list, matching too little is the
+  dangerous direction, because it deletes an account somebody meant to keep. Subdomains
+  now match, and a lookalike such as `evilpartner.com` still does not.
+- **`Invoke-GraphGetAll` returned an inconsistent shape.** Returning a `List` let
+  PowerShell unroll it, so no results came back as `$null` and one result as a bare
+  object. It always returns an array now.
+- **An Unspecified-Kind DateTime was shifted by the machine's offset.**
+  `ToUniversalTime()` treats such a value as local time. Graph values are UTC, so the
+  shift could move an account across a threshold by a day depending on the machine. An
+  Unspecified Kind is now stamped as UTC rather than converted.
+- **The Blob sink failed confusingly on an abort.** `Export-Csv` writes no file for an
+  empty input, so the upload then failed with a storage error that hid the real reason for
+  the abort. An abort now records the run summary instead.
+- **Configuring a report sink without selecting it was silent.** Setting the Teams webhook
+  or the storage account while `-ReportSink` does not include that sink now warns.
+- **PIM-eligible role holders were not protected.** The role assignment read returns
+  active assignments only, so a guest merely *eligible* for an administrator role was
+  fair game. Eligible assignments are now included, degrading with a warning on a tenant
+  without Entra ID P2 rather than failing the run.
+
+### Changed
+
+- **Failure alerting is part of the deployment, not an afterthought.** `-Stage All`
+  creates the alert when `-AlertEmail` is given, and says loudly when it is not.
+  `-Stage Verify` reports a missing alert as a problem and prints the last run status.
+  `-Stage Schedule` refuses to schedule enforcement unless a failure alert exists and is
+  switched on, with `-SkipAlertCheck` as a deliberate override. A scheduled job that
+  deletes accounts should not run with nobody watching for failed runs.
+- `.gitignore` excludes `.claude/`, so local agent configuration does not follow the
+  project into a public repository.
+
+### Notes
+
+Three things were checked and cleared rather than changed: listing
+`/roleManagement/directory/roleAssignments` without `$filter` is documented as supported;
+`continue` inside the `switch` in `Write-Report` does not skip the remaining sinks; and
+the dot-source guard behaves correctly under every invocation style tested
+(`pwsh -File`, the call operator, `Invoke-Expression`, `pwsh -Command`, and a scriptblock
+built from the file), suppressing the run only when the file is genuinely dot-sourced.
+
 ## [1.1.0] - 2026-08-28
 
 Simpler deployment, working failure alerting, and three fixes found by checking

@@ -22,6 +22,10 @@ TestResults/
 testResults.xml
 coverage.xml
 
+# Local agent and editor config. Not part of the tool, and a public repo does not need
+# somebody's local permission rules.
+.claude/
+
 # PowerShell and editor noise
 *.ps1xml.bak
 .vscode/

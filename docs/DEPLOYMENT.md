@@ -43,12 +43,19 @@ Grants take a few minutes to reach the Automation sandbox.
 
 ```powershell
 ./deploy/Deploy-StaleGuestCleanup.ps1 -Stage All `
-    -ResourceGroupName "<rg>" -AutomationAccountName "<aa>"
+    -ResourceGroupName "<rg>" -AutomationAccountName "<aa>" `
+    -AlertEmail "<address>"
 ```
 
-One command. It imports `Microsoft.Graph.Authentication`, waits for the import to
-finish, publishes the runbook, then checks the module, the runbook, the managed identity,
-and every Graph role by name.
+One command. It imports `Microsoft.Graph.Authentication`, waits for the import to finish,
+publishes the runbook, creates the failure alert (switched off), then checks the module,
+the runbook, the managed identity, every Graph role by name, the alert, and the last run
+status.
+
+**Give `-AlertEmail`.** It is optional only so the command still works without it, and in
+that case `All` says loudly that alerting is missing. A scheduled job that deletes
+accounts needs somebody watching for failed runs, and step 7 refuses to schedule
+enforcement until an alert exists and is on.
 
 Module import takes several minutes, and the stage waits rather than making you poll.
 
@@ -118,7 +125,10 @@ parameter is what stands between a report and a deletion.
 
 Prove it once with `-WhatIf` before the first enforcing run.
 
-## 6. Set up failure alerting
+## 6. Switch failure alerting on
+
+Step 2 already created the alert if you passed `-AlertEmail`. If you did not, create it
+now:
 
 ```powershell
 ./deploy/Deploy-StaleGuestCleanup.ps1 -Stage Alert `
@@ -218,9 +228,14 @@ Let one cycle run in report mode. Then:
     -RunbookParameters @{ Mode = 'Enforce'; DeleteAfterDays = 150; MaxDeletesPerRun = 50 }
 ```
 
-The Schedule stage refuses to schedule enforcement if the runbook has never completed a
-run in that Automation Account. The whole rollout depends on somebody having read a
-report, so that check is deliberate.
+The Schedule stage refuses to schedule enforcement unless **both** of these hold:
+
+- the runbook has completed at least one run in that Automation Account, so somebody has
+  had a report to read, and
+- a failure alert exists **and is switched on**, so a failed run reaches a person.
+
+Both checks are deliberate. `-SkipAlertCheck` overrides the second one, and is only for a
+tenant where failed Automation jobs already reach somebody another way.
 
 ## 8. Draining a backlog
 
