@@ -136,6 +136,51 @@ Describe 'Invoke-StaleGuestCleanup orchestration' {
         }
     }
 
+    Context 'report mode does not invent deferrals' {
+
+        It 'labels every actionable row as report-only, even past the cap' {
+            # The caps only matter when the job acts. Marking rows "Deferred by the per-run
+            # cap" in report mode made the first report read as though half the backlog had
+            # been handled and the rest queued, when nothing had been touched.
+            Mock -CommandName Get-GuestUser -MockWith { New-GuestSet -Count 120 -InactiveDays 400 }
+
+            $script:capturedRows = $null
+            Mock -CommandName Write-ReportToJobLog -MockWith { $script:capturedRows = $Rows }
+
+            Invoke-StaleGuestCleanup @script:Defaults -Mode Report -MaxDeletesPerRun 50 -ReportSink JobLog -AbortIfCandidatesExceed 10000
+
+            $outcomes = @($script:capturedRows | Where-Object { $_.Action -ne 'NoAction' } | Select-Object -ExpandProperty Outcome -Unique)
+            $outcomes.Count | Should -Be 1
+            $outcomes[0]    | Should -Be 'Report only, not applied'
+            @($script:capturedRows | Where-Object { $_.Outcome -like '*Deferred*' }).Count | Should -Be 0
+        }
+
+        It 'reports zero deferred in the summary for a report run' {
+            Mock -CommandName Get-GuestUser -MockWith { New-GuestSet -Count 120 -InactiveDays 400 }
+
+            $script:capturedSummary = $null
+            Mock -CommandName Write-ReportToJobLog -MockWith { $script:capturedSummary = $Summary }
+
+            Invoke-StaleGuestCleanup @script:Defaults -Mode Report -MaxDeletesPerRun 50 -ReportSink JobLog -AbortIfCandidatesExceed 10000
+
+            $script:capturedSummary.Deleted         | Should -Be 0
+            $script:capturedSummary.DeletesDeferred | Should -Be 0
+            $script:capturedSummary.DeleteCandidates | Should -Be 120
+        }
+
+        It 'still reports deferrals honestly in enforce mode' {
+            Mock -CommandName Get-GuestUser -MockWith { New-GuestSet -Count 120 -InactiveDays 400 }
+
+            $script:capturedSummary = $null
+            Mock -CommandName Write-ReportToJobLog -MockWith { $script:capturedSummary = $Summary }
+
+            Invoke-StaleGuestCleanup @script:Defaults -Mode Enforce -MaxDeletesPerRun 50 -ReportSink JobLog -AbortIfCandidatesExceed 10000
+
+            $script:capturedSummary.Deleted         | Should -Be 50
+            $script:capturedSummary.DeletesDeferred | Should -Be 70
+        }
+    }
+
     Context 'enforce mode' {
 
         It 'disables accounts between the two thresholds and deletes those past the second' {

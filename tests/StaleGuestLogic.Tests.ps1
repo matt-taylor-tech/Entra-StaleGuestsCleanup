@@ -120,6 +120,26 @@ Describe 'ConvertTo-NullableUtc' {
     It 'returns null rather than throwing on an unparseable value' {
         ConvertTo-NullableUtc -Value 'not a date' | Should -BeNullOrEmpty
     }
+
+    It 'stamps an Unspecified-Kind DateTime as UTC instead of shifting it' {
+        # ToUniversalTime() on an Unspecified Kind treats it as local time and moves it by
+        # the machine offset. Graph values are UTC, so a shift here can push an account
+        # across a threshold by a day depending on where the machine is.
+        $unspecified = [datetime]::new(2026, 3, 4, 5, 6, 7, [System.DateTimeKind]::Unspecified)
+        $result = ConvertTo-NullableUtc -Value $unspecified
+
+        $result.Kind   | Should -Be 'Utc'
+        $result.Hour   | Should -Be 5      # unchanged
+        $result.Day    | Should -Be 4
+    }
+
+    It 'still converts a Local-Kind DateTime properly' {
+        $local = [datetime]::new(2026, 3, 4, 5, 6, 7, [System.DateTimeKind]::Local)
+        $result = ConvertTo-NullableUtc -Value $local
+
+        $result.Kind | Should -Be 'Utc'
+        $result      | Should -Be $local.ToUniversalTime()
+    }
 }
 
 Describe 'Get-GuestLastActivity' {
@@ -308,6 +328,24 @@ Describe 'Get-ExclusionReason' {
         # A pending invite often has no mail address, so the UPN is all there is.
         $noMail = ConvertTo-GuestRecord (New-TestGuest -Mail $null)
         Get-ExclusionReason -Record $noMail -ExcludeDomains @('partner.com') | Should -Match 'partner.com'
+    }
+
+    It 'excludes a subdomain of an excluded domain' {
+        # A rule for partner.com must also protect someone@eu.partner.com. For an
+        # exclusion list, matching too little is the dangerous direction: it deletes an
+        # account somebody meant to keep.
+        $sub = ConvertTo-GuestRecord (New-TestGuest -Mail 'someone@eu.partner.com' -Upn 'someone_eu.partner.com#EXT#@contoso.onmicrosoft.com')
+        Get-ExclusionReason -Record $sub -ExcludeDomains @('partner.com') | Should -Match 'partner.com'
+    }
+
+    It 'excludes a deeply nested subdomain' {
+        $sub = ConvertTo-GuestRecord (New-TestGuest -Mail 'x@a.b.partner.com' -Upn 'x_a.b.partner.com#EXT#@contoso.onmicrosoft.com')
+        Get-ExclusionReason -Record $sub -ExcludeDomains @('partner.com') | Should -Match 'partner.com'
+    }
+
+    It 'still refuses a lookalike domain that merely ends the same way' {
+        $sub = ConvertTo-GuestRecord (New-TestGuest -Mail 'x@evilpartner.com' -Upn 'x_evilpartner.com#EXT#@contoso.onmicrosoft.com')
+        Get-ExclusionReason -Record $sub -ExcludeDomains @('partner.com') | Should -BeNullOrEmpty
     }
 
     It 'does not treat one domain as excluded just because it is a suffix of another' {

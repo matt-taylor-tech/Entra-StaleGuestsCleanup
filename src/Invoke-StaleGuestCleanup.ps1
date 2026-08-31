@@ -195,7 +195,19 @@ function ConvertTo-NullableUtc {
 
     try {
         $parsed = switch ($Value) {
-            { $_ -is [datetime] }       { ([datetime]$_).ToUniversalTime() }
+            { $_ -is [datetime] } {
+                # ToUniversalTime() on a DateTime whose Kind is Unspecified treats it as
+                # local and shifts it by the machine's offset. Graph values are UTC, so an
+                # Unspecified Kind is stamped as UTC rather than converted. Getting this
+                # wrong moves an account across a threshold by up to a day.
+                $dt = [datetime]$_
+                if ($dt.Kind -eq [System.DateTimeKind]::Unspecified) {
+                    [datetime]::SpecifyKind($dt, [System.DateTimeKind]::Utc)
+                }
+                else {
+                    $dt.ToUniversalTime()
+                }
+            }
             { $_ -is [datetimeoffset] } { ([datetimeoffset]$_).UtcDateTime }
             default {
                 [datetime]::Parse(
@@ -441,8 +453,15 @@ function Get-ExclusionReason {
         foreach ($domain in $ExcludeDomains) {
             $clean = $domain.TrimStart('@').Trim()
             if (-not $clean) { continue }
+
+            # Match the domain itself and any subdomain of it, so a rule for partner.com
+            # also protects someone@eu.partner.com. For an exclusion list, matching too
+            # little is the dangerous direction: it deletes an account somebody meant to
+            # keep. The label boundary still keeps notpartner.com out.
+            $pattern = "(@|_)([A-Za-z0-9-]+\.)*" + [regex]::Escape($clean) + "(#EXT#|$)"
+
             foreach ($candidate in $candidates) {
-                if ($candidate -imatch ("(@|_)" + [regex]::Escape($clean) + "(#EXT#|$)")) {
+                if ($candidate -imatch $pattern) {
                     return "Domain $clean is on the excluded domain list."
                 }
             }
@@ -494,18 +513,35 @@ function Connect-GraphApi {
     }
 }
 
-function Invoke-GraphWithRetry {
+function Invoke-GraphRequestWithRetry {
     <#
-        Runs a Graph call and retries it if Graph throttles or is briefly unavailable.
+        Makes one Graph request and retries it if Graph throttles or is briefly
+        unavailable.
 
         A run can make a hundred or more write calls, and Graph throttles writes to /users.
         Without this a single 429 would fail one account, fail the job, and send a
         needless alert. Retry-After is honoured when Graph sends it, because Graph's own
         number is better than a guess.
+
+        The request is described by parameters rather than by a scriptblock. An earlier
+        version took a scriptblock that splatted a variable from the calling function,
+        which worked only because the caller happened to sit in the scope chain. Called
+        from anywhere else the splat silently resolved to an empty hashtable and the
+        request went out with no method and no URI, with no error at all.
     #>
     param(
         [Parameter(Mandatory = $true)]
-        [scriptblock]$Action,
+        [string]$Uri,
+
+        [Parameter(Mandatory = $false)]
+        [ValidateSet('GET', 'POST', 'PATCH', 'PUT', 'DELETE')]
+        [string]$Method = 'GET',
+
+        [Parameter(Mandatory = $false)]
+        $Body,
+
+        [Parameter(Mandatory = $false)]
+        [hashtable]$Headers,
 
         [Parameter(Mandatory = $false)]
         [string]$Description = 'Graph call',
@@ -514,9 +550,17 @@ function Invoke-GraphWithRetry {
         [int]$MaxAttempts = 4
     )
 
+    $params = @{
+        Method      = $Method
+        Uri         = $Uri
+        ErrorAction = 'Stop'
+    }
+    if ($null -ne $Body) { $params['Body'] = $Body }
+    if ($Headers)        { $params['Headers'] = $Headers }
+
     for ($attempt = 1; ; $attempt++) {
         try {
-            return & $Action
+            return Invoke-MgGraphRequest @params
         }
         catch {
             $status = $null
@@ -565,14 +609,8 @@ function Invoke-GraphGetAll {
 
     while ($next) {
         $page++
-        $params = @{
-            Method      = 'GET'
-            Uri         = $next
-            ErrorAction = 'Stop'
-        }
-        if ($Headers) { $params['Headers'] = $Headers }
 
-        $response = Invoke-GraphWithRetry -Description "GET page $page" -Action { Invoke-MgGraphRequest @params }
+        $response = Invoke-GraphRequestWithRetry -Method GET -Uri $next -Headers $Headers -Description "GET page $page"
 
         if ($response.value) {
             foreach ($item in $response.value) { $results.Add($item) }
@@ -585,7 +623,10 @@ function Invoke-GraphGetAll {
         }
     }
 
-    return $results
+    # Always hand back an array. Returning the List let PowerShell unroll it, so a caller
+    # got $null for no results and a bare object for one, which is a trap for the next
+    # change even though every current caller happens to survive it.
+    return Write-Output -InputObject $results.ToArray() -NoEnumerate
 }
 
 function Get-GuestUser {
@@ -635,7 +676,26 @@ function Get-DirectoryRoleHolderId {
             if ($a.principalId) { [void]$set.Add([string]$a.principalId) }
         }
 
-        Write-Log "Found $($set.Count) principals holding a directory role."
+        $activeCount = $set.Count
+
+        # Also cover PIM: a principal that is only *eligible* for a role holds no active
+        # assignment, so the call above does not see it. Somebody who can raise themselves
+        # to Global Administrator should not be removed by a scheduled job.
+        #
+        # This one degrades rather than failing closed. Eligibility needs Entra ID P2, and
+        # a tenant without it answers with an error that is not a permission problem.
+        try {
+            $eligibleUri = 'https://graph.microsoft.com/v1.0/roleManagement/directory/roleEligibilitySchedules?$select=principalId'
+            foreach ($e in (Invoke-GraphGetAll -Uri $eligibleUri)) {
+                if ($e.principalId) { [void]$set.Add([string]$e.principalId) }
+            }
+            Write-Log "Found $activeCount principals with an active directory role, and $($set.Count - $activeCount) more eligible for one."
+        }
+        catch {
+            Write-Log "Could not read PIM role eligibility, so only active role assignments are protected. This is expected without Entra ID P2. Error: $($_.Exception.Message)" -Level WARNING
+            Write-Log "Found $activeCount principals holding an active directory role."
+        }
+
         return $set
     }
     catch {
@@ -711,12 +771,10 @@ function Disable-GuestAccount {
         [string]$UserId
     )
 
-    Invoke-GraphWithRetry -Description "Disable $UserId" -Action {
-        Invoke-MgGraphRequest -Method PATCH `
-            -Uri "https://graph.microsoft.com/v1.0/users/$UserId" `
-            -Body @{ accountEnabled = $false } `
-            -ErrorAction Stop
-    } | Out-Null
+    Invoke-GraphRequestWithRetry -Method PATCH `
+        -Uri "https://graph.microsoft.com/v1.0/users/$UserId" `
+        -Body @{ accountEnabled = $false } `
+        -Description "Disable $UserId" | Out-Null
 }
 
 function Remove-GuestAccount {
@@ -725,11 +783,9 @@ function Remove-GuestAccount {
         [string]$UserId
     )
 
-    Invoke-GraphWithRetry -Description "Delete $UserId" -Action {
-        Invoke-MgGraphRequest -Method DELETE `
-            -Uri "https://graph.microsoft.com/v1.0/users/$UserId" `
-            -ErrorAction Stop
-    } | Out-Null
+    Invoke-GraphRequestWithRetry -Method DELETE `
+        -Uri "https://graph.microsoft.com/v1.0/users/$UserId" `
+        -Description "Delete $UserId" | Out-Null
 }
 
 #endregion
@@ -809,19 +865,27 @@ function Write-ReportToJobLog {
     # thousands of candidates. A single formatted table would be one enormous output
     # record, and Azure Automation caps the size of a record, so the report would be
     # truncated exactly when it is most needed. Separate lines each stay small.
-    $ordered = $actioned |
-        Sort-Object -Property @{ Expression = 'Action'; Descending = $true }, @{ Expression = 'InactiveDays'; Descending = $true }
+    # Take from each action separately, then combine.
+    #
+    # A single list sorted by Action put every Delete ahead of every Disable, and the row
+    # limit was then applied across the lot. On a backlog of a thousand deletes the
+    # handful of disables never appeared, which are exactly the accounts likely to
+    # produce a "I have lost access" call. Disables go first and are almost never capped.
+    $disables = @($actioned | Where-Object { $_.Action -eq 'Disable' } | Sort-Object InactiveDays -Descending)
+    $deletes  = @($actioned | Where-Object { $_.Action -eq 'Delete' }  | Sort-Object InactiveDays -Descending)
 
-    $shown = [math]::Min($actioned.Count, $script:JobLogRowLimit)
+    $disableBudget = [math]::Min($disables.Count, [math]::Max(1, [int]($script:JobLogRowLimit / 2)))
+    $deleteBudget  = $script:JobLogRowLimit - $disableBudget
+    if ($deleteBudget -lt 0) { $deleteBudget = 0 }
 
-    Write-Log "Accounts that met a threshold: $($actioned.Count). Listing $shown."
+    $ordered = @($disables | Select-Object -First $disableBudget) +
+               @($deletes  | Select-Object -First $deleteBudget)
+    $shown = $ordered.Count
+
+    Write-Log "Accounts that met a threshold: $($actioned.Count) ($($disables.Count) to disable, $($deletes.Count) to delete). Listing $shown."
     Write-Output 'Action,InactiveDays,Basis,Outcome,Company,UserPrincipalName'
 
-    $i = 0
     foreach ($row in $ordered) {
-        if ($i -ge $shown) { break }
-        $i++
-
         # Quote the two free-text fields, so a comma in a company name cannot shift columns.
         Write-Output ('{0},{1},{2},"{3}","{4}",{5}' -f
             $row.Action,
@@ -833,8 +897,10 @@ function Write-ReportToJobLog {
     }
 
     if ($actioned.Count -gt $shown) {
-        $remaining = $actioned.Count - $shown
-        Write-Log "$remaining more accounts are not listed above, ordered least stale first." -Level WARNING
+        $omittedDisables = $disables.Count - [math]::Min($disables.Count, $disableBudget)
+        $omittedDeletes  = $deletes.Count  - [math]::Min($deletes.Count,  $deleteBudget)
+
+        Write-Log "Not listed above: $omittedDisables disables and $omittedDeletes deletes. The ones left out are the least stale of each." -Level WARNING
         Write-Log 'The job log is not the place for a list this long. Add Blob to -ReportSink for the full CSV, which is also the audit trail that outlives the job history.' -Level WARNING
     }
 }
@@ -857,6 +923,9 @@ function Write-ReportToBlob {
         [string]$ContainerName,
 
         [Parameter(Mandatory = $false)]
+        $Summary,
+
+        [Parameter(Mandatory = $false)]
         [string]$ClientId
     )
 
@@ -877,12 +946,23 @@ function Write-ReportToBlob {
         }
     }
 
-    $stamp    = (Get-Date -Format 'yyyyMMdd-HHmmss')
-    $blobName = "stale-guests-$stamp.csv"
+    $stamp = (Get-Date -Format 'yyyyMMdd-HHmmss')
+
+    # An abort produces no per-account rows. Export-Csv writes no file at all for an empty
+    # input, and the upload then failed with a storage error that hid the real reason for
+    # the abort. Record the summary instead, so the audit trail still shows the run.
+    $summaryOnly = ($Rows.Count -eq 0)
+    $blobName = if ($summaryOnly) { "stale-guests-$stamp-summary-only.csv" } else { "stale-guests-$stamp.csv" }
     $tempFile = Join-Path ([System.IO.Path]::GetTempPath()) $blobName
 
     try {
-        $Rows | Export-Csv -Path $tempFile -NoTypeInformation -Encoding UTF8
+        if ($summaryOnly) {
+            Write-Log 'No per-account rows to write, so the blob records the run summary only.'
+            @($Summary) | Export-Csv -Path $tempFile -NoTypeInformation -Encoding UTF8
+        }
+        else {
+            $Rows | Export-Csv -Path $tempFile -NoTypeInformation -Encoding UTF8
+        }
 
         $context = New-AzStorageContext -StorageAccountName $StorageAccountName -UseConnectedAccount -ErrorAction Stop
         Set-AzStorageBlobContent -File $tempFile -Container $ContainerName -Blob $blobName -Context $context -Force -ErrorAction Stop | Out-Null
@@ -976,6 +1056,7 @@ function Write-Report {
                 Write-ReportToBlob -Rows $Rows `
                     -StorageAccountName $Options.StorageAccountName `
                     -ContainerName $Options.ContainerName `
+                    -Summary $Summary `
                     -ClientId $Options.ManagedIdentityClientId
             }
             'Teams' {
@@ -1024,6 +1105,15 @@ function Invoke-StaleGuestCleanup {
 
     if ($DeleteAfterDays -lt $DisableAfterDays) {
         throw "DeleteAfterDays ($DeleteAfterDays) cannot be lower than DisableAfterDays ($DisableAfterDays). An account would be deleted before it was ever disabled."
+    }
+
+    # Catch the quiet mistake of configuring a sink and never selecting it. Without this
+    # you set the webhook, see nothing in Teams, and have no clue why.
+    if ($TeamsWebhookUrl -and $ReportSink -notcontains 'Teams') {
+        Write-Log "A Teams webhook is configured but 'Teams' is not in -ReportSink, so nothing will be posted. Add Teams to -ReportSink." -Level WARNING
+    }
+    if ($StorageAccountName -and $ReportSink -notcontains 'Blob') {
+        Write-Log "A storage account is configured but 'Blob' is not in -ReportSink, so no CSV will be written. Add Blob to -ReportSink." -Level WARNING
     }
 
     if (-not (Connect-GraphApi -ClientId $ManagedIdentityClientId)) {
@@ -1125,10 +1215,30 @@ function Invoke-StaleGuestCleanup {
     }
 
     # ----- Apply the per-run caps -----------------------------------------------------
+    #
+    # Only when the job is going to act. In report mode nothing is attempted, so nothing
+    # is deferred: saying otherwise made the first report read as though half the backlog
+    # had been handled and the rest queued, when the tenant had not been touched at all.
     $toDisable = @()
     $toDelete  = @()
+    $disablesDeferred = 0
+    $deletesDeferred  = 0
 
-    if (-not $aborted) {
+    if ($aborted) {
+        # Nothing is attempted, and the rows already say Aborted.
+    }
+    elseif ($Mode -eq 'Report') {
+        # Report the projection instead, which is the useful number: how long the current
+        # caps would take to clear what was found.
+        if ($disableCandidate.Count -gt $MaxDisablesPerRun -or $deleteCandidate.Count -gt $MaxDeletesPerRun) {
+            $disableRuns = if ($MaxDisablesPerRun -gt 0) { [math]::Ceiling($disableCandidate.Count / $MaxDisablesPerRun) } else { 0 }
+            $deleteRuns  = if ($MaxDeletesPerRun  -gt 0) { [math]::Ceiling($deleteCandidate.Count  / $MaxDeletesPerRun)  } else { 0 }
+            $runsNeeded  = [math]::Max($disableRuns, $deleteRuns)
+
+            Write-Log "At the current caps ($MaxDisablesPerRun disables and $MaxDeletesPerRun deletes per run) this backlog would take about $runsNeeded runs to clear." -Level WARNING
+        }
+    }
+    else {
         $toDisable = @($disableCandidate | Select-Object -First $MaxDisablesPerRun)
         $toDelete  = @($deleteCandidate  | Select-Object -First $MaxDeletesPerRun)
 
@@ -1150,10 +1260,6 @@ function Invoke-StaleGuestCleanup {
                 $row.Outcome = 'Deferred by the per-run cap'
             }
         }
-    }
-    else {
-        $disablesDeferred = $disableCandidate.Count
-        $deletesDeferred  = $deleteCandidate.Count
     }
 
     # ----- Act ------------------------------------------------------------------------
