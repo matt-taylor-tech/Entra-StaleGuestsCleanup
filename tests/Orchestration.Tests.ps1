@@ -405,6 +405,44 @@ Describe 'Invoke-StaleGuestCleanup orchestration' {
             $script:Disabled.Count | Should -Be 10
         }
 
+        It 'reports disable counts that reconcile against the candidate total' {
+            # The summary reads "N disable candidates (applied X, deferred Y)". X has to
+            # count disable candidates only. Counting the interim disables there too made a
+            # live run report "86 candidates (applied 2, deferred 86)", which cannot be true
+            # of 86 accounts, in the log that is the audit record for account changes.
+            Mock -CommandName Get-GuestUser -MockWith {
+                @(New-GuestSet -Count 10 -InactiveDays 95  -Prefix 'dis') +
+                @(New-GuestSet -Count 10 -InactiveDays 900 -Prefix 'del')
+            }
+            Mock -CommandName Write-ReportToJobLog -MockWith { $script:capturedSummary = $Summary }
+
+            Invoke-StaleGuestCleanup @script:Defaults -Mode Enforce -ReportSink JobLog `
+                -MaxDeletesPerRun 0 -MaxDisablesPerRun 4
+
+            # Every slot goes to the 900-day delete candidates, so no disable candidate
+            # was touched and the disable line must say so.
+            $script:capturedSummary.Disabled        | Should -Be 0
+            $script:capturedSummary.InterimDisables | Should -Be 4
+            ($script:capturedSummary.Disabled + $script:capturedSummary.DisablesDeferred) |
+                Should -Be $script:capturedSummary.DisableCandidates
+        }
+
+        It 'reconciles when both queues get slots in the same run' {
+            Mock -CommandName Get-GuestUser -MockWith {
+                @(New-GuestSet -Count 10 -InactiveDays 95  -Prefix 'dis') +
+                @(New-GuestSet -Count 3  -InactiveDays 900 -Prefix 'del')
+            }
+            Mock -CommandName Write-ReportToJobLog -MockWith { $script:capturedSummary = $Summary }
+
+            Invoke-StaleGuestCleanup @script:Defaults -Mode Enforce -ReportSink JobLog `
+                -MaxDeletesPerRun 0 -MaxDisablesPerRun 8
+
+            # The 3 oldest go first, then 5 of the 10 disable candidates fill the rest.
+            $script:capturedSummary.InterimDisables | Should -Be 3
+            $script:capturedSummary.Disabled        | Should -Be 5
+            ($script:capturedSummary.Disabled + $script:capturedSummary.DisablesDeferred) |
+                Should -Be $script:capturedSummary.DisableCandidates
+        }
         It 'neutralises the most stale first, across both queues' {
             Mock -CommandName Get-GuestUser -MockWith {
                 @(New-GuestSet -Count 5 -InactiveDays 95  -Prefix 'young') +
