@@ -46,6 +46,34 @@ Describe 'Write-Log never writes to the success stream' {
         @(Get-ThingSuccess).Count | Should -Be 3
     }
 
+    It 'puts the log line on the verbose stream, where Automation can capture it' {
+        # Write-Host also keeps the success stream clean, but Azure Automation discards it:
+        # a real run produced 501 Output records and not one INFO line. Verbose is the only
+        # writer that satisfies both, so pin the stream and not just the cleanliness.
+        function Get-ThingStreams {
+            Write-Log 'a log line'
+            return @(1, 2, 3)
+        }
+
+        $VerbosePreference = 'Continue'
+        $merged = @(Get-ThingStreams 4>&1)
+
+        @($merged | Where-Object { $_ -is [System.Management.Automation.VerboseRecord] }).Count |
+            Should -BeGreaterThan 0
+        @($merged | Where-Object { $_ -is [System.Management.Automation.VerboseRecord] -and
+                                   $_.Message -match 'a log line' }).Count | Should -Be 1
+    }
+
+    It 'keeps the success stream clean even while verbose output is on' {
+        function Get-ThingStreamsClean {
+            Write-Log 'noise'
+            return @(1, 2, 3)
+        }
+
+        $VerbosePreference = 'Continue'
+        @(Get-ThingStreamsClean).Count | Should -Be 3
+    }
+
     It 'survives many log lines around the data' {
         function Get-ThingChatty {
             Write-Log 'starting'

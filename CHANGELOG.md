@@ -9,6 +9,25 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Log lines vanished from the Azure Automation job log.** The previous fix moved `Write-Log`
+  from `Write-Output` to `Write-Host`, which does keep the success stream clean but which
+  Azure Automation discards: a real run came back with 501 Output records, 3 Warning records
+  and not one INFO line, so `Guests read` — the count that exposed the original defect — was
+  gone. `Write-Verbose` is the only writer that both stays off the success stream and reaches
+  an Automation job log. INFO and SUCCESS now use it, the runbook sets `$VerbosePreference`
+  to `Continue` on the direct-invocation path only (so dot-sourcing for tests stays quiet),
+  `-Stage Runbook` switches `-LogVerbose` on after publishing, and `Verify` fails if it is
+  off. `tests/GraphReadContract.Tests.ps1` now pins the stream, not just the cleanliness, and
+  that test fails against `Write-Host`.
+
+### Changed
+
+- **`-Stage Runbook` no longer claims there is no schedule when there is one.** The closing
+  line was hardcoded and printed regardless of the facts, so a fully scheduled deployment
+  read as unfinished. It now looks the link up and names the schedule it found. It also warns
+  that republishing can recreate that link — observed in practice, where the `JobScheduleId`
+  changed across a republish — so the parameters are worth re-checking with `-JobScheduleId`.
+
 - **The job never evaluated a single guest account.** `Write-Log` sent INFO and SUCCESS to
   `Write-Output`. The success stream is a function's return value, so every log line a
   data-returning function wrote came back to its caller. `Get-GuestUser` returned six log
