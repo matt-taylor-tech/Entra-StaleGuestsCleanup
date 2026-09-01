@@ -70,11 +70,13 @@ BeforeAll {
             [int]$Count,
             [int]$InactiveDays,
             [switch]$NeverSignedIn,
+            [bool]$Enabled = $true,
             [string]$Prefix = 'g'
         )
 
         1..$Count | ForEach-Object {
             New-GuestFixture -InactiveDays $InactiveDays -NeverSignedIn:$NeverSignedIn `
+                -Enabled $Enabled `
                 -Id "$Prefix-$_" -Upn "$Prefix$_@example.com" -Mail "$Prefix$_@example.com"
         }
     }
@@ -104,7 +106,8 @@ Describe 'Invoke-StaleGuestCleanup orchestration' {
             DeleteAfterDays         = 120
             MaxDisablesPerRun       = 50
             MaxDeletesPerRun        = 50
-            AbortIfCandidatesExceed = 500
+            AbortIfDeleteCandidatesExceed  = 10000
+            AbortIfDisableCandidatesExceed = 10000
             ContainerName           = 'test'
             ReportSink              = @('None')
         }
@@ -147,7 +150,7 @@ Describe 'Invoke-StaleGuestCleanup orchestration' {
             $script:capturedRows = $null
             Mock -CommandName Write-ReportToJobLog -MockWith { $script:capturedRows = $Rows }
 
-            Invoke-StaleGuestCleanup @script:Defaults -Mode Report -MaxDeletesPerRun 50 -ReportSink JobLog -AbortIfCandidatesExceed 10000
+            Invoke-StaleGuestCleanup @script:Defaults -Mode Report -MaxDeletesPerRun 50 -ReportSink JobLog -AbortIfDeleteCandidatesExceed 10000
 
             $outcomes = @($script:capturedRows | Where-Object { $_.Action -ne 'NoAction' } | Select-Object -ExpandProperty Outcome -Unique)
             $outcomes.Count | Should -Be 1
@@ -161,7 +164,7 @@ Describe 'Invoke-StaleGuestCleanup orchestration' {
             $script:capturedSummary = $null
             Mock -CommandName Write-ReportToJobLog -MockWith { $script:capturedSummary = $Summary }
 
-            Invoke-StaleGuestCleanup @script:Defaults -Mode Report -MaxDeletesPerRun 50 -ReportSink JobLog -AbortIfCandidatesExceed 10000
+            Invoke-StaleGuestCleanup @script:Defaults -Mode Report -MaxDeletesPerRun 50 -ReportSink JobLog -AbortIfDeleteCandidatesExceed 10000
 
             $script:capturedSummary.Deleted         | Should -Be 0
             $script:capturedSummary.DeletesDeferred | Should -Be 0
@@ -174,7 +177,7 @@ Describe 'Invoke-StaleGuestCleanup orchestration' {
             $script:capturedSummary = $null
             Mock -CommandName Write-ReportToJobLog -MockWith { $script:capturedSummary = $Summary }
 
-            Invoke-StaleGuestCleanup @script:Defaults -Mode Enforce -MaxDeletesPerRun 50 -ReportSink JobLog -AbortIfCandidatesExceed 10000
+            Invoke-StaleGuestCleanup @script:Defaults -Mode Enforce -MaxDeletesPerRun 50 -ReportSink JobLog -AbortIfDeleteCandidatesExceed 10000
 
             $script:capturedSummary.Deleted         | Should -Be 50
             $script:capturedSummary.DeletesDeferred | Should -Be 70
@@ -277,6 +280,9 @@ Describe 'Invoke-StaleGuestCleanup orchestration' {
         }
 
         It 'caps disables and deletes independently' {
+            # The disable slots now go to the most stale accounts across both queues, so
+            # here they go to the 200-day delete candidates the delete cap held back, not
+            # to the 95-day disable candidates. The caps themselves stay independent.
             Mock -CommandName Get-GuestUser -MockWith {
                 @(New-GuestSet -Count 20 -InactiveDays 95  -Prefix 'dis') +
                 @(New-GuestSet -Count 20 -InactiveDays 200 -Prefix 'del')
@@ -289,36 +295,127 @@ Describe 'Invoke-StaleGuestCleanup orchestration' {
         }
     }
 
-    Context 'the abort ceiling' {
+    Context 'the abort ceilings' {
 
-        It 'stops the run and changes nothing when there are too many candidates' {
+        It 'freezes the deletes when the delete ceiling is reached, and fails the job' {
             Mock -CommandName Get-GuestUser -MockWith { New-GuestSet -Count 60 -InactiveDays 200 }
 
-            { Invoke-StaleGuestCleanup @script:Defaults -Mode Enforce -AbortIfCandidatesExceed 50 } |
-                Should -Throw -ExpectedMessage '*above the ceiling*'
-
-            $script:Disabled.Count | Should -Be 0
-            $script:Deleted.Count  | Should -Be 0
-        }
-
-        It 'counts disables and deletes together against the ceiling' {
-            Mock -CommandName Get-GuestUser -MockWith {
-                @(New-GuestSet -Count 30 -InactiveDays 95  -Prefix 'dis') +
-                @(New-GuestSet -Count 30 -InactiveDays 200 -Prefix 'del')
-            }
-
-            { Invoke-StaleGuestCleanup @script:Defaults -Mode Enforce -AbortIfCandidatesExceed 50 } |
+            { Invoke-StaleGuestCleanup @script:Defaults -Mode Enforce -AbortIfDeleteCandidatesExceed 50 } |
                 Should -Throw -ExpectedMessage '*above the ceiling*'
 
             $script:Deleted.Count | Should -Be 0
         }
 
-        It 'runs normally when the candidate count is inside the ceiling' {
+        It 'still disables the accounts it refuses to delete, so the access goes' {
+            # This is the point of splitting the ceilings. A single combined ceiling
+            # stopped everything, which left the most stale accounts in the directory
+            # enabled and usable until somebody intervened by hand.
+            Mock -CommandName Get-GuestUser -MockWith { New-GuestSet -Count 60 -InactiveDays 200 }
+
+            { Invoke-StaleGuestCleanup @script:Defaults -Mode Enforce -AbortIfDeleteCandidatesExceed 50 } |
+                Should -Throw
+
+            $script:Deleted.Count  | Should -Be 0
+            $script:Disabled.Count | Should -Be 50
+        }
+
+        It 'freezes the disables when the disable ceiling is reached, and fails the job' {
+            Mock -CommandName Get-GuestUser -MockWith { New-GuestSet -Count 60 -InactiveDays 95 }
+
+            { Invoke-StaleGuestCleanup @script:Defaults -Mode Enforce -AbortIfDisableCandidatesExceed 50 } |
+                Should -Throw -ExpectedMessage '*above the ceiling*'
+
+            $script:Disabled.Count | Should -Be 0
+        }
+
+        It 'still deletes when only the disable ceiling is reached' {
+            Mock -CommandName Get-GuestUser -MockWith {
+                @(New-GuestSet -Count 60 -InactiveDays 95  -Prefix 'dis') +
+                @(New-GuestSet -Count 5  -InactiveDays 200 -Prefix 'del')
+            }
+
+            { Invoke-StaleGuestCleanup @script:Defaults -Mode Enforce -AbortIfDisableCandidatesExceed 50 } |
+                Should -Throw
+
+            $script:Disabled.Count | Should -Be 0
+            $script:Deleted.Count  | Should -Be 5
+        }
+
+        It 'counts each action against its own ceiling, not the combined total' {
+            # 30 of each. A single combined ceiling of 50 used to abort on the total of 60.
+            Mock -CommandName Get-GuestUser -MockWith {
+                @(New-GuestSet -Count 30 -InactiveDays 95  -Prefix 'dis') +
+                @(New-GuestSet -Count 30 -InactiveDays 200 -Prefix 'del')
+            }
+
+            Invoke-StaleGuestCleanup @script:Defaults -Mode Enforce `
+                -AbortIfDeleteCandidatesExceed 50 -AbortIfDisableCandidatesExceed 50
+
+            $script:Deleted.Count  | Should -Be 30
+            $script:Disabled.Count | Should -Be 30
+        }
+
+        It 'runs normally when both counts are inside their ceilings' {
             Mock -CommandName Get-GuestUser -MockWith { New-GuestSet -Count 10 -InactiveDays 200 }
 
-            Invoke-StaleGuestCleanup @script:Defaults -Mode Enforce -AbortIfCandidatesExceed 50
+            Invoke-StaleGuestCleanup @script:Defaults -Mode Enforce -AbortIfDeleteCandidatesExceed 50
 
             $script:Deleted.Count | Should -Be 10
+        }
+
+        It 'treats 0 as no ceiling at all' {
+            Mock -CommandName Get-GuestUser -MockWith { New-GuestSet -Count 60 -InactiveDays 200 }
+
+            Invoke-StaleGuestCleanup @script:Defaults -Mode Enforce `
+                -AbortIfDeleteCandidatesExceed 0 -MaxDeletesPerRun 1000
+
+            $script:Deleted.Count | Should -Be 60
+        }
+    }
+
+    Context 'delete candidates waiting their turn' {
+
+        It 'disables a delete candidate the per-run cap held back' {
+            Mock -CommandName Get-GuestUser -MockWith { New-GuestSet -Count 20 -InactiveDays 200 }
+
+            Invoke-StaleGuestCleanup @script:Defaults -Mode Enforce -MaxDeletesPerRun 5
+
+            $script:Deleted.Count  | Should -Be 5
+            $script:Disabled.Count | Should -Be 15
+        }
+
+        It 'leaves an already disabled one alone' {
+            Mock -CommandName Get-GuestUser -MockWith {
+                New-GuestSet -Count 20 -InactiveDays 200 -Enabled $false
+            }
+
+            Invoke-StaleGuestCleanup @script:Defaults -Mode Enforce -MaxDeletesPerRun 5
+
+            $script:Deleted.Count  | Should -Be 5
+            $script:Disabled.Count | Should -Be 0
+        }
+
+        It 'holds the interim disables to the disable cap' {
+            Mock -CommandName Get-GuestUser -MockWith { New-GuestSet -Count 100 -InactiveDays 200 }
+
+            Invoke-StaleGuestCleanup @script:Defaults -Mode Enforce `
+                -MaxDeletesPerRun 5 -MaxDisablesPerRun 10
+
+            $script:Deleted.Count  | Should -Be 5
+            $script:Disabled.Count | Should -Be 10
+        }
+
+        It 'neutralises the most stale first, across both queues' {
+            Mock -CommandName Get-GuestUser -MockWith {
+                @(New-GuestSet -Count 5 -InactiveDays 95  -Prefix 'young') +
+                @(New-GuestSet -Count 5 -InactiveDays 900 -Prefix 'old')
+            }
+
+            Invoke-StaleGuestCleanup @script:Defaults -Mode Enforce `
+                -MaxDeletesPerRun 0 -MaxDisablesPerRun 5
+
+            @($script:Disabled | Where-Object { $_ -like 'old-*' }).Count   | Should -Be 5
+            @($script:Disabled | Where-Object { $_ -like 'young-*' }).Count | Should -Be 0
         }
     }
 
@@ -339,7 +436,7 @@ Describe 'Invoke-StaleGuestCleanup orchestration' {
                 }
             }
 
-            { Invoke-StaleGuestCleanup @script:Defaults -Mode Enforce -AbortIfCandidatesExceed 10000 } |
+            { Invoke-StaleGuestCleanup @script:Defaults -Mode Enforce -AbortIfDeleteCandidatesExceed 10000 } |
                 Should -Throw -ExpectedMessage '*AuditLog.Read.All*'
 
             $script:Deleted.Count | Should -Be 0
@@ -351,7 +448,7 @@ Describe 'Invoke-StaleGuestCleanup orchestration' {
                 @(New-GuestSet -Count 39 -InactiveDays 500 -NeverSignedIn -Prefix 'pending')
             }
 
-            Invoke-StaleGuestCleanup @script:Defaults -Mode Enforce -MaxDeletesPerRun 1000 -AbortIfCandidatesExceed 10000
+            Invoke-StaleGuestCleanup @script:Defaults -Mode Enforce -MaxDeletesPerRun 1000 -AbortIfDeleteCandidatesExceed 10000
 
             $script:Deleted.Count | Should -Be 39
             $script:Deleted | Should -Not -Contain 'active'
@@ -411,7 +508,7 @@ Describe 'Invoke-StaleGuestCleanup orchestration' {
                 $set
             }
 
-            Invoke-StaleGuestCleanup @script:Defaults -Mode Enforce -AbortIfCandidatesExceed 10
+            Invoke-StaleGuestCleanup @script:Defaults -Mode Enforce -AbortIfDeleteCandidatesExceed 10
 
             $script:Deleted.Count | Should -Be 2
         }

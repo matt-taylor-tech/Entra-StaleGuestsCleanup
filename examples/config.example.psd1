@@ -40,7 +40,12 @@
     # Stop the run and change nothing if the candidate count is above this. A number
     # far above your normal run is the point. It catches a bad threshold or a lost
     # permission before either becomes a mass deletion.
-    AbortIfCandidatesExceed = 500
+    # Deletion is irreversible after 30 days, so keep this tight.
+    AbortIfDeleteCandidatesExceed  = 500
+
+    # Loose on purpose. Disabling is reversible and removes access, so blocking it
+    # protects nothing and only leaves stale accounts enabled. 0 means no ceiling.
+    AbortIfDisableCandidatesExceed = 2000
 
     # ----- Exclusions -------------------------------------------------------------
     # Object ID of a group whose members are never touched, nested groups included.

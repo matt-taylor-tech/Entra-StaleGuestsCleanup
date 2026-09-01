@@ -74,15 +74,30 @@ removes something it should not have. After 30 days it is gone.
 | `-Mode Report` (default) | Evaluates everything, changes nothing |
 | `-WhatIf` | Standard PowerShell dry run, works in enforce mode too |
 | `-MaxDisablesPerRun` / `-MaxDeletesPerRun` | Caps one run. Most stale accounts go first, so repeated runs drain the backlog oldest first |
-| `-AbortIfCandidatesExceed` | Stops the run and changes nothing when the candidate count is unexpectedly high |
+| `-AbortIfDeleteCandidatesExceed` | Skips the deletes when the delete candidate count is unexpectedly high. The disables still run |
+| `-AbortIfDisableCandidatesExceed` | Skips the disables when the disable candidate count is unexpectedly high. Deliberately loose |
 | Null sign-in data guard | If *no* guest in a sizeable directory has a sign-in date, the job aborts instead of treating the whole directory as stale. This is what happens if `AuditLog.Read.All` is ever removed, and without the guard it would be a mass deletion |
 | Directory role check | A guest holding any directory role is skipped and logged |
 | Missing data check | A guest with no sign-in history *and* no creation date is never actioned |
 | `-ExcludeGroupId` | Members of that group are never touched, nested groups included |
 | `-ExcludeDomains` / `-ExcludeUpn` | Leave named domains or accounts alone |
 
-Excluded accounts do not count towards the abort ceiling, so a large and correctly
-excluded partner domain cannot block every run.
+Excluded accounts do not count towards either ceiling, so a large and correctly excluded
+partner domain cannot block every run.
+
+**The two ceilings gate their own action and nothing else.** A delete ceiling freezes
+deletion and fails the job so somebody looks at it, while the disables carry on and the
+access still goes. One combined ceiling used to stop the whole run, so an unexpected
+delete count also blocked the reversible action. That failed closed in the worst way:
+nothing drained, the backlog kept growing past the ceiling, and the job could never
+recover on its own.
+
+**Anything queued for deletion but not deleted this run gets disabled instead.** Held
+back by the cap, or frozen by the ceiling, it makes no difference: the account is past
+the delete threshold, so it is disabled while it waits. Before that, accounts past the
+delete threshold were the only ones that never got the safe reversible action, because
+delete is tested before disable. On a large backlog that left hundreds of the most stale
+accounts in the directory enabled for months.
 
 ## Quick start
 
@@ -154,7 +169,8 @@ Connect-MgGraph -Scopes "User.Read.All","AuditLog.Read.All","GroupMember.Read.Al
 | `Mode` | `Report` | `Report` or `Enforce` |
 | `MaxDisablesPerRun` | 50 | Per-run cap |
 | `MaxDeletesPerRun` | 50 | Per-run cap |
-| `AbortIfCandidatesExceed` | 500 | Abort ceiling on total candidates |
+| `AbortIfDeleteCandidatesExceed` | 500 | Skip the deletes above this many delete candidates. 0 means no ceiling |
+| `AbortIfDisableCandidatesExceed` | 2000 | Skip the disables above this many disable candidates. 0 means no ceiling |
 | `ExcludeGroupId` | none | Group whose members are never touched |
 | `ExcludeDomains` | none | Domains to leave alone |
 | `ExcludeUpn` | none | Individual accounts to leave alone |
@@ -215,7 +231,8 @@ Invoke-Pester -Path ./tests
 66 tests, no tenant needed. They matter more than a live test does: a guest you create
 today is zero days old, so no tenant run can exercise a 90 or 120 day boundary.
 Synthetic dates can. The orchestration tests mock the Graph layer and cover the caps,
-the abort ceiling, the null-data guard, and the report-only gate.
+both abort ceilings, the interim disable of accounts waiting to be deleted, the
+null-data guard, and the report-only gate.
 
 ## Requirements
 

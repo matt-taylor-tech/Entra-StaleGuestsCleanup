@@ -10,7 +10,9 @@ Day-to-day running of the stale guest cleanup job.
 3. Works out how long each guest has been inactive.
 4. Applies the exclusions.
 5. Decides: delete, disable, or leave alone.
-6. Stops if the candidate count is above the abort ceiling.
+6. Skips the deletes if the delete candidate count is above its ceiling, and skips the
+   disables if the disable candidate count is above its own. Each ceiling gates only its
+   own action.
 7. Applies the per-run caps, most stale accounts first.
 8. Acts, unless the mode is `Report`.
 9. Writes the report.
@@ -102,7 +104,10 @@ Fix the permission, then re-run in report mode. **No account was changed.**
 
 ### The run aborted with "above the ceiling"
 
-More candidates than `AbortIfCandidatesExceed`. Nothing was changed.
+More delete candidates than `AbortIfDeleteCandidatesExceed`, or more disable candidates
+than `AbortIfDisableCandidatesExceed`. Only the action that hit its ceiling was skipped.
+A frozen delete does not stop the disables, so accounts waiting to be deleted are still
+disabled and the access is gone. Read the summary: it names whichever ceiling was hit.
 
 Check, in this order:
 
@@ -164,7 +169,7 @@ The runbook throws, and so produces a failed job, when:
 
 - an account operation fails,
 - the sign-in data is unusable,
-- the candidate count is above the abort ceiling.
+- either candidate count is above its own abort ceiling.
 
 So all three reach the alert. A run that finds nothing to do completes quietly.
 
