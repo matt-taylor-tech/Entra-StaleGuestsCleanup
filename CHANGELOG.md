@@ -9,6 +9,22 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The job never evaluated a single guest account.** `Write-Log` sent INFO and SUCCESS to
+  `Write-Output`. The success stream is a function's return value, so every log line a
+  data-returning function wrote came back to its caller. `Get-GuestUser` returned six log
+  strings plus one array holding every guest, the caller saw seven objects, and
+  `ConvertTo-GuestRecord` turned each into an empty record with no sign-in date and no
+  creation date. The missing-data rail then correctly refused to action any of them, so the
+  job reported `Guests read: 7` and `0 to disable, 0 to delete` against a tenant of 2196
+  guests, 1520 of them past a 125 day delete threshold. It reported success every time.
+  INFO and SUCCESS now use `Write-Host`, which cannot enter the success stream.
+
+  This was invisible to the test suite because `Orchestration.Tests.ps1` mocks both
+  `Write-Log` and `Get-GuestUser`, so neither the logger's stream nor the guest read's
+  return shape was ever exercised. `tests/GraphReadContract.Tests.ps1` now pins both,
+  using the real functions and mocking only the HTTP layer. Those tests fail 8 of 8
+  against the old code.
+
 - **The Alert stage could not create the metric alert.** Az.Monitor renamed a parameter
   on `New-AzMetricAlertRuleV2DimensionSelection` at version 5: `-ValueOnly` became
   `-ValuesToInclude`, and current versions do not accept the old name at all. The stage
