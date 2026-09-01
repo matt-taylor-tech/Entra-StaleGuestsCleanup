@@ -7,6 +7,47 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed - BREAKING
+
+`AbortIfCandidatesExceed` is replaced by `AbortIfDeleteCandidatesExceed` (default 500)
+and `AbortIfDisableCandidatesExceed` (default 2000). Anyone passing the old parameter
+must rename it. **This warrants a 2.0.0 release.**
+
+- **One combined ceiling stopped the whole run, which was the wrong failure.** An
+  unexpected *delete* count also blocked the *disables* - the reversible action that
+  removes access. It failed closed in the worst possible way: nothing drained, the
+  backlog kept growing past the ceiling, and the job could never recover without somebody
+  intervening by hand. Measured on a live tenant: 589 candidates against a ceiling of 500
+  meant every run aborted and changed nothing, indefinitely.
+
+  Each ceiling now gates only its own action. A delete ceiling freezes deletion and fails
+  the job so a person looks at it, while access removal carries on automatically. Either
+  ceiling still fails the job, so the failure alert fires either way.
+
+- **The disable ceiling defaults loose, at 2000, and that is deliberate.** Ask what a
+  ceiling protects against: sign-in data going missing, or a filter change. Both are
+  already caught by the null sign-in guard and by the delete ceiling. Blocking disables
+  protects nothing - it only leaves stale accounts enabled. 0 now means no ceiling.
+
+### Fixed
+
+- **Accounts past the delete threshold were the only ones never disabled.** Delete is
+  tested before disable, so an account past `DeleteAfterDays` was classified `Delete` and
+  the disable branch was never reached. If the per-run cap or the ceiling then held it
+  back, it got no action at all and stayed enabled and usable. On a live tenant with 505
+  delete candidates and a cap of 50, that left 455 of the most stale accounts in the
+  directory enabled for up to five and a half months.
+
+  Anything queued for deletion but not deleted this run is now disabled instead, unless
+  it is already disabled. The disable queue is ordered by inactivity across both sources,
+  so the most stale accounts are neutralised first, and it still respects
+  `MaxDisablesPerRun`. Reported as `InterimDisables` in the summary, and rows read
+  `Disabled while waiting to be deleted` rather than `Disabled`.
+
+- Report-mode rows no longer read `Aborted` when a ceiling is reached. A report changes
+  nothing whatever the ceilings say, so they read `Report only, not applied`. The ceiling
+  is still logged as an error and named in the summary.
+
 ### Fixed
 
 - **Log lines vanished from the Azure Automation job log.** The previous fix moved `Write-Log`

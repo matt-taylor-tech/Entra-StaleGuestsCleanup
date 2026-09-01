@@ -33,7 +33,8 @@ Requirements:   PowerShell 7.2 or later
                 Az.Accounts + Az.Storage        (only if -ReportSink includes Blob)
 
 Safety:         Defaults to -Mode Report, which changes nothing. Enforcement must be
-                asked for. Per-run caps and an abort ceiling limit the damage a wrong
+                asked for. Per-run caps and two abort ceilings, one per action, limit
+                the damage a wrong
                 parameter can do. A deleted Entra user is restorable for 30 days.
 =============================================================================================
 #>
@@ -69,11 +70,23 @@ param(
     [ValidateRange(0, 100000)]
     [int]$MaxDeletesPerRun = 50,
 
-    # Stop the run and change nothing if the candidate count is above this.
+    # Skip the DELETES if the delete candidate count is above this. 0 means no ceiling.
     # Guards against a filter or permission change that makes everything look stale.
+    # Deletion is only reversible for 30 days, so this ceiling is deliberately tight.
     [Parameter(Mandatory = $false)]
-    [ValidateRange(1, 1000000)]
-    [int]$AbortIfCandidatesExceed = 500,
+    [ValidateRange(0, 1000000)]
+    [int]$AbortIfDeleteCandidatesExceed = 500,
+
+    # Skip the DISABLES if the disable candidate count is above this. 0 means no ceiling.
+    #
+    # Deliberately loose, and loose is the safe direction here. Disabling is reversible
+    # and it removes access. The two things a ceiling exists to catch - sign-in data going
+    # missing, and a filter change - are already caught by the null sign-in guard and by
+    # the delete ceiling. Blocking disables protects nothing: it only leaves stale
+    # accounts enabled.
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(0, 1000000)]
+    [int]$AbortIfDisableCandidatesExceed = 2000,
 
     # ----- Exclusions -------------------------------------------------------------------
     # Object ID of a group whose members are never touched. Nested groups are honoured.
@@ -866,6 +879,11 @@ function Write-ReportToJobLog {
     Write-Log "Excluded:           $($Summary.Excluded)"
     Write-Log "Disable candidates: $($Summary.DisableCandidates)  (applied $($Summary.Disabled), deferred $($Summary.DisablesDeferred))"
     Write-Log "Delete candidates:  $($Summary.DeleteCandidates)  (applied $($Summary.Deleted), deferred $($Summary.DeletesDeferred))"
+    if ($Summary.InterimDisables) {
+        Write-Log "  of which:         $($Summary.InterimDisables) were disabled while they wait to be deleted"
+    }
+    if ($Summary.DeleteCeilingHit)  { Write-Log "Delete ceiling:     REACHED, no account was deleted" }
+    if ($Summary.DisableCeilingHit) { Write-Log "Disable ceiling:    REACHED, no account was disabled" }
     Write-Log "Failures:           $($Summary.Failures)"
     Write-Log '---------------------------------------------------------------------------'
 
@@ -1093,7 +1111,7 @@ function Write-Report {
 function Invoke-StaleGuestCleanup {
     <#
         The whole job. Every input is an explicit parameter rather than a script-scope
-        variable, so the caps, the abort ceiling and the report-only gate can be tested
+        variable, so the caps, the abort ceilings and the report-only gate can be tested
         without a tenant. Defaults live in the script param block at the top of the file,
         which is the one place that states them.
     #>
@@ -1104,7 +1122,8 @@ function Invoke-StaleGuestCleanup {
         [string]$Mode,
         [int]$MaxDisablesPerRun,
         [int]$MaxDeletesPerRun,
-        [int]$AbortIfCandidatesExceed,
+        [int]$AbortIfDeleteCandidatesExceed,
+        [int]$AbortIfDisableCandidatesExceed,
         [string]$ExcludeGroupId,
         [string[]]$ExcludeDomains = @(),
         [string[]]$ExcludeUpn = @(),
@@ -1213,37 +1232,59 @@ function Invoke-StaleGuestCleanup {
     $excludedCount    = @($rows | Where-Object { $_.Excluded }).Count
     $disableCandidate = @($rows | Where-Object { $_.Action -eq 'Disable' }) | Sort-Object InactiveDays -Descending
     $deleteCandidate  = @($rows | Where-Object { $_.Action -eq 'Delete' })  | Sort-Object InactiveDays -Descending
-    $candidateTotal   = $disableCandidate.Count + $deleteCandidate.Count
 
     Write-Log "Evaluated $($rows.Count) guests. $($disableCandidate.Count) to disable, $($deleteCandidate.Count) to delete, $excludedCount excluded."
 
-    # ----- Abort ceiling --------------------------------------------------------------
-    $aborted = $false
-    $abortReason = $null
-    if ($candidateTotal -gt $AbortIfCandidatesExceed) {
-        $aborted = $true
-        $abortReason = "$candidateTotal candidates is above the ceiling of $AbortIfCandidatesExceed. No account was changed. Review the report, then either raise -AbortIfCandidatesExceed on purpose or fix the thresholds."
-        Write-Log $abortReason -Level ERROR
+    # ----- Abort ceilings, one per action ---------------------------------------------
+    #
+    # Two ceilings, and each gates only its own action.
+    #
+    # A single combined ceiling stopped the whole run, so an unexpected DELETE count also
+    # blocked the DISABLES - the reversible action that removes access. That failed closed
+    # in the worst possible way: nothing drained, the backlog kept growing past the
+    # ceiling, and the job could never recover without somebody intervening by hand.
+    #
+    # Now a delete ceiling freezes deletion and escalates it to a person, while access
+    # removal carries on automatically. Either ceiling still fails the job, so the failure
+    # alert reaches somebody either way.
+    $deleteCeilingHit  = $AbortIfDeleteCandidatesExceed  -gt 0 -and
+                         $deleteCandidate.Count  -gt $AbortIfDeleteCandidatesExceed
+    $disableCeilingHit = $AbortIfDisableCandidatesExceed -gt 0 -and
+                         $disableCandidate.Count -gt $AbortIfDisableCandidatesExceed
 
-        foreach ($row in $rows) {
-            if ($row.Action -ne 'NoAction') { $row.Outcome = 'Aborted' }
-        }
+    $abortReasons = [System.Collections.Generic.List[string]]::new()
+    if ($deleteCeilingHit) {
+        $reason = "$($deleteCandidate.Count) delete candidates is above the ceiling of $AbortIfDeleteCandidatesExceed. No account was deleted. Review the report, then either raise -AbortIfDeleteCandidatesExceed on purpose or fix the thresholds."
+        $abortReasons.Add($reason)
+        Write-Log $reason -Level ERROR
+    }
+    if ($disableCeilingHit) {
+        $reason = "$($disableCandidate.Count) disable candidates is above the ceiling of $AbortIfDisableCandidatesExceed. No account was disabled. Review the report, then either raise -AbortIfDisableCandidatesExceed on purpose or fix the thresholds."
+        $abortReasons.Add($reason)
+        Write-Log $reason -Level ERROR
     }
 
-    # ----- Apply the per-run caps -----------------------------------------------------
+    $aborted     = $abortReasons.Count -gt 0
+    $abortReason = if ($aborted) { $abortReasons -join ' ' } else { $null }
+
+    # ----- Build the queues -----------------------------------------------------------
     #
-    # Only when the job is going to act. In report mode nothing is attempted, so nothing
-    # is deferred: saying otherwise made the first report read as though half the backlog
-    # had been handled and the rest queued, when the tenant had not been touched at all.
+    # Deletes are worked out first, because what is left over feeds the disables.
+    #
+    # A delete candidate that is not being deleted this run - held back by the cap, or
+    # frozen by the ceiling - is still an enabled account well past the delete threshold.
+    # It used to be left completely alone, which meant the most stale accounts in the
+    # directory were the only ones that never got the safe, reversible action: they were
+    # classified Delete, so the Disable branch was never reached. On a large backlog that
+    # left hundreds of accounts enabled and usable for months. Now they are disabled while
+    # they wait their turn.
     $toDisable = @()
     $toDelete  = @()
     $disablesDeferred = 0
     $deletesDeferred  = 0
+    $interimDisables  = 0
 
-    if ($aborted) {
-        # Nothing is attempted, and the rows already say Aborted.
-    }
-    elseif ($Mode -eq 'Report') {
+    if ($Mode -eq 'Report') {
         # Report the projection instead, which is the useful number: how long the current
         # caps would take to clear what was found.
         if ($disableCandidate.Count -gt $MaxDisablesPerRun -or $deleteCandidate.Count -gt $MaxDeletesPerRun) {
@@ -1255,24 +1296,52 @@ function Invoke-StaleGuestCleanup {
         }
     }
     else {
-        $toDisable = @($disableCandidate | Select-Object -First $MaxDisablesPerRun)
-        $toDelete  = @($deleteCandidate  | Select-Object -First $MaxDeletesPerRun)
+        # Deletes: nothing at all if the ceiling is hit, otherwise the most stale first.
+        if (-not $deleteCeilingHit) {
+            $toDelete = @($deleteCandidate | Select-Object -First $MaxDeletesPerRun)
+        }
+        $deletesDeferred = $deleteCandidate.Count - $toDelete.Count
 
-        $disablesDeferred = $disableCandidate.Count - $toDisable.Count
-        $deletesDeferred  = $deleteCandidate.Count  - $toDelete.Count
+        # Everything past the delete threshold that is not being deleted now, and is still
+        # enabled, joins the disable queue. An account already disabled needs nothing.
+        $deletingIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($r in $toDelete) { [void]$deletingIds.Add([string]$r.Id) }
+        $waiting = @($deleteCandidate | Where-Object {
+            -not $deletingIds.Contains([string]$_.Id) -and $_.AccountEnabled })
+
+        # Disables: most stale first across both sources. A guest past the delete threshold
+        # is more stale than one that has only passed the disable threshold, so it gets
+        # neutralised first.
+        if (-not $disableCeilingHit) {
+            $disableQueue = @(@($disableCandidate) + @($waiting)) | Sort-Object InactiveDays -Descending
+            $toDisable    = @($disableQueue | Select-Object -First $MaxDisablesPerRun)
+        }
+
+        $interimDisables  = @($toDisable | Where-Object { $_.Action -eq 'Delete' }).Count
+        $disablesDeferred = $disableCandidate.Count -
+                            @($toDisable | Where-Object { $_.Action -eq 'Disable' }).Count
 
         if ($disablesDeferred -gt 0) {
             Write-Log "$disablesDeferred disable candidates are deferred to a later run by the cap of $MaxDisablesPerRun." -Level WARNING
         }
         if ($deletesDeferred -gt 0) {
-            Write-Log "$deletesDeferred delete candidates are deferred to a later run by the cap of $MaxDeletesPerRun." -Level WARNING
+            Write-Log "$deletesDeferred delete candidates are not being deleted this run. $interimDisables of them are being disabled instead, so the access is gone while they wait." -Level WARNING
         }
 
-        # Mark the deferred rows, so the report never reads as "everything handled".
-        $actionedIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-        foreach ($r in @($toDisable + $toDelete)) { [void]$actionedIds.Add([string]$r.Id) }
+        # Mark every row that is not queued, so the report never reads as "all handled".
+        $queuedIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($r in @(@($toDisable) + @($toDelete))) { [void]$queuedIds.Add([string]$r.Id) }
         foreach ($row in $rows) {
-            if ($row.Action -ne 'NoAction' -and -not $actionedIds.Contains([string]$row.Id)) {
+            if ($row.Action -eq 'NoAction') { continue }
+            if ($queuedIds.Contains([string]$row.Id)) { continue }
+
+            if ($row.Action -eq 'Delete' -and $deleteCeilingHit) {
+                $row.Outcome = 'Not deleted, delete ceiling reached'
+            }
+            elseif ($row.Action -eq 'Disable' -and $disableCeilingHit) {
+                $row.Outcome = 'Not disabled, disable ceiling reached'
+            }
+            else {
                 $row.Outcome = 'Deferred by the per-run cap'
             }
         }
@@ -1291,7 +1360,7 @@ function Invoke-StaleGuestCleanup {
             }
         }
     }
-    elseif (-not $aborted) {
+    else {
 
         foreach ($row in $toDisable) {
             if (-not $SkipGroupMemberships) {
@@ -1306,7 +1375,13 @@ function Invoke-StaleGuestCleanup {
 
             try {
                 Disable-GuestAccount -UserId $row.Id
-                $row.Outcome = 'Disabled'
+                # A row whose Action is Delete is being disabled while it waits its turn,
+                # so say that rather than 'Disabled', which would read as the final state.
+                $row.Outcome = if ($row.Action -eq 'Delete') {
+                    'Disabled while waiting to be deleted'
+                } else {
+                    'Disabled'
+                }
                 $disabled++
                 Write-Log "Disabled $($row.UserPrincipalName), inactive $($row.InactiveDays) days, basis $($row.Basis)." -Level SUCCESS
             }
@@ -1361,9 +1436,12 @@ function Invoke-StaleGuestCleanup {
         DeleteCandidates  = $deleteCandidate.Count
         Deleted           = $deleted
         DeletesDeferred   = $deletesDeferred
+        InterimDisables   = $interimDisables
         Failures          = $failures
         Aborted           = $aborted
         AbortReason       = $abortReason
+        DeleteCeilingHit  = $deleteCeilingHit
+        DisableCeilingHit = $disableCeilingHit
     }
 
     Write-Report -Rows @($rows) -Summary $summary -Sink $ReportSink -Options @{
@@ -1414,7 +1492,8 @@ if ($MyInvocation.InvocationName -ne '.') {
         Mode                    = $Mode
         MaxDisablesPerRun       = $MaxDisablesPerRun
         MaxDeletesPerRun        = $MaxDeletesPerRun
-        AbortIfCandidatesExceed = $AbortIfCandidatesExceed
+        AbortIfDeleteCandidatesExceed  = $AbortIfDeleteCandidatesExceed
+        AbortIfDisableCandidatesExceed = $AbortIfDisableCandidatesExceed
         ExcludeGroupId          = $ExcludeGroupId
         ExcludeDomains          = $ExcludeDomains
         ExcludeUpn              = $ExcludeUpn

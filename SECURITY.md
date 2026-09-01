@@ -34,7 +34,7 @@ These are deliberate and worth keeping if you fork the project.
   cannot change an account whatever its parameters say. This is the strongest control
   available, because it does not depend on anyone remembering which mode a schedule is in.
 - **Report-only by default.** `-Mode Enforce` has to be asked for.
-- **Per-run caps and an abort ceiling.** A wrong threshold cannot turn into a mass
+- **Per-run caps and two abort ceilings, one per action.** A wrong threshold cannot turn into a mass
   deletion in one run.
 - **Fails closed on missing data.** If the sign-in data is unusable, or the exclusion group
   or directory role list cannot be read, the job stops rather than acting on an incomplete
