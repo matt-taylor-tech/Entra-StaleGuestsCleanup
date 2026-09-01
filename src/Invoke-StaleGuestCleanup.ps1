@@ -124,8 +124,16 @@ $ErrorActionPreference = 'Stop'
 function Write-Log {
     <#
         In Azure Automation there is no persistent local disk, so log lines go to the job
-        output streams instead of a file. INFO/SUCCESS -> output, WARNING -> warning,
-        ERROR -> error (non-terminating, so the run can finish and still report).
+        streams instead of a file. INFO/SUCCESS -> host, WARNING -> warning, ERROR -> error
+        (non-terminating, so the run can finish and still report).
+
+        INFO and SUCCESS use Write-Host, NOT Write-Output, and that is load bearing.
+        Write-Output writes to the success stream, and the success stream IS a function's
+        return value. With Write-Output here, `$x = Get-Thing` captured every log line
+        Get-Thing wrote. Get-GuestUser returned six log strings plus a single array holding
+        every guest, so the caller saw seven objects, the whole guest list was converted to
+        one unreadable record, and no account was ever actioned. A logger must never write
+        to the success stream.
     #>
     param(
         [Parameter(Mandatory = $true)]
@@ -142,7 +150,7 @@ function Write-Log {
     switch ($Level) {
         'ERROR'   { Write-Error   $logMessage -ErrorAction Continue }
         'WARNING' { Write-Warning $logMessage }
-        default   { Write-Output  $logMessage }
+        default   { Write-Host    $logMessage }
     }
 }
 
