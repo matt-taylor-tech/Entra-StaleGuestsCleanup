@@ -1282,7 +1282,7 @@ function Invoke-StaleGuestCleanup {
     $toDelete  = @()
     $disablesDeferred = 0
     $deletesDeferred  = 0
-    $interimDisables  = 0
+    $interimPlanned   = 0
 
     if ($Mode -eq 'Report') {
         # Report the projection instead, which is the useful number: how long the current
@@ -1317,7 +1317,7 @@ function Invoke-StaleGuestCleanup {
             $toDisable    = @($disableQueue | Select-Object -First $MaxDisablesPerRun)
         }
 
-        $interimDisables  = @($toDisable | Where-Object { $_.Action -eq 'Delete' }).Count
+        $interimPlanned   = @($toDisable | Where-Object { $_.Action -eq 'Delete' }).Count
         $disablesDeferred = $disableCandidate.Count -
                             @($toDisable | Where-Object { $_.Action -eq 'Disable' }).Count
 
@@ -1325,7 +1325,7 @@ function Invoke-StaleGuestCleanup {
             Write-Log "$disablesDeferred disable candidates are deferred to a later run by the cap of $MaxDisablesPerRun." -Level WARNING
         }
         if ($deletesDeferred -gt 0) {
-            Write-Log "$deletesDeferred delete candidates are not being deleted this run. $interimDisables of them are being disabled instead, so the access is gone while they wait." -Level WARNING
+            Write-Log "$deletesDeferred delete candidates are not being deleted this run. $interimPlanned of them are being disabled instead, so the access is gone while they wait." -Level WARNING
         }
 
         # Mark every row that is not queued, so the report never reads as "all handled".
@@ -1348,9 +1348,14 @@ function Invoke-StaleGuestCleanup {
     }
 
     # ----- Act ------------------------------------------------------------------------
-    $disabled = 0
-    $deleted  = 0
-    $failures = 0
+    # Counted separately so the summary reconciles. $disabled must only ever count
+    # accounts that were disable candidates, because it is reported against the disable
+    # candidate total. Lumping the interim disables in here made the line read
+    # "86 candidates (applied 2, deferred 86)", which cannot be true of 86 accounts.
+    $disabled        = 0
+    $interimDisabled = 0
+    $deleted         = 0
+    $failures        = 0
 
     if ($Mode -eq 'Report') {
         Write-Log 'Mode is Report, so nothing is changed. Run with -Mode Enforce to apply these decisions.'
@@ -1382,7 +1387,7 @@ function Invoke-StaleGuestCleanup {
                 } else {
                     'Disabled'
                 }
-                $disabled++
+                if ($row.Action -eq 'Delete') { $interimDisabled++ } else { $disabled++ }
                 Write-Log "Disabled $($row.UserPrincipalName), inactive $($row.InactiveDays) days, basis $($row.Basis)." -Level SUCCESS
             }
             catch {
@@ -1436,7 +1441,7 @@ function Invoke-StaleGuestCleanup {
         DeleteCandidates  = $deleteCandidate.Count
         Deleted           = $deleted
         DeletesDeferred   = $deletesDeferred
-        InterimDisables   = $interimDisables
+        InterimDisables   = $interimDisabled
         Failures          = $failures
         Aborted           = $aborted
         AbortReason       = $abortReason

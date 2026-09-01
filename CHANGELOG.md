@@ -31,6 +31,13 @@ must rename it. **This warrants a 2.0.0 release.**
 
 ### Fixed
 
+- **The disable counts in the summary did not reconcile.** A live run reported
+  `Disable candidates: 86  (applied 2, deferred 86)`, which cannot be true of 86 accounts.
+  The applied figure counted every disable including the interim ones, while the deferred
+  figure counted only unactioned disable candidates. Both were individually right and the
+  line mixed them, in the log that is the audit record for account changes. Interim disables
+  are now counted separately and reported only on their own line.
+
 - **Accounts past the delete threshold were the only ones never disabled.** Delete is
   tested before disable, so an account past `DeleteAfterDays` was classified `Delete` and
   the disable branch was never reached. If the per-run cap or the ceiling then held it
