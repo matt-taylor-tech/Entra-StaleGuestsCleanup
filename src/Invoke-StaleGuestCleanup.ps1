@@ -127,13 +127,21 @@ function Write-Log {
         streams instead of a file. INFO/SUCCESS -> host, WARNING -> warning, ERROR -> error
         (non-terminating, so the run can finish and still report).
 
-        INFO and SUCCESS use Write-Host, NOT Write-Output, and that is load bearing.
+        INFO and SUCCESS use Write-Verbose, NOT Write-Output, and that is load bearing.
         Write-Output writes to the success stream, and the success stream IS a function's
         return value. With Write-Output here, `$x = Get-Thing` captured every log line
         Get-Thing wrote. Get-GuestUser returned six log strings plus a single array holding
         every guest, so the caller saw seven objects, the whole guest list was converted to
         one unreadable record, and no account was ever actioned. A logger must never write
         to the success stream.
+
+        Write-Host was the first fix and it was wrong: it keeps the return value clean, but
+        Azure Automation does not capture it. A real run produced 501 Output records and 3
+        Warning records, and not one INFO line, so the guests-read count vanished from the
+        job log. Write-Verbose is the only writer that both stays off the success stream and
+        reaches an Automation job log, and it needs two things to show up: VerbosePreference
+        set to Continue in the run, and 'Log verbose records' enabled on the runbook. The
+        deploy script sets the second and Verify checks it.
     #>
     param(
         [Parameter(Mandatory = $true)]
@@ -150,7 +158,7 @@ function Write-Log {
     switch ($Level) {
         'ERROR'   { Write-Error   $logMessage -ErrorAction Continue }
         'WARNING' { Write-Warning $logMessage }
-        default   { Write-Host    $logMessage }
+        default   { Write-Verbose $logMessage }
     }
 }
 
@@ -1380,6 +1388,12 @@ function Invoke-StaleGuestCleanup {
 # Run, unless the file was dot-sourced. Dot-sourcing loads the functions without acting,
 # which is how the test files reach them.
 if ($MyInvocation.InvocationName -ne '.') {
+
+    # Write-Log sends INFO and SUCCESS to Write-Verbose, which emits nothing unless this is
+    # Continue. Set here rather than at script scope so dot-sourcing the file for tests does
+    # not turn verbose output on for the whole test run. Preference variables are
+    # dynamically scoped, so this covers everything called from here down.
+    $VerbosePreference = 'Continue'
 
     # An Automation Account variable fills in a value that was not passed on the command
     # line, so the schedule can be retuned without republishing the runbook. An explicit

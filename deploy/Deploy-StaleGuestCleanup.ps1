@@ -288,6 +288,12 @@ function Invoke-RunbookStage {
     Publish-AzAutomationRunbook @common -Name $RunbookName | Out-Null
     Write-Stage "  [+] Published $RunbookName." 'Green'
 
+    # The runbook logs INFO and SUCCESS through Write-Verbose, so without this the job log
+    # holds the report rows and nothing else. Learned the hard way: a run came back with 501
+    # Output records and no INFO line at all.
+    Set-AzAutomationRunbook @common -Name $RunbookName -LogVerbose $true | Out-Null
+    Write-Stage '  [+] Verbose logging on, so the job log keeps the INFO lines.' 'Green'
+
     if ($RunbookType -eq 'PowerShell') {
         Write-Stage '  [!] Type PowerShell is Windows PowerShell 5.1. The job needs 7.2 or later.' 'Red'
     }
@@ -410,6 +416,16 @@ function Invoke-VerifyStage {
     }
     else {
         Write-Stage '  [i]  The runbook has never run. Start one by hand in -Mode Report next.' 'DarkGray'
+    }
+
+    $rb = Get-AzAutomationRunbook @common -Name $RunbookName -ErrorAction SilentlyContinue
+    if ($rb -and $rb.LogVerbose) {
+        Write-Stage '  [ok] Verbose logging is on, so the job log keeps the INFO lines.' 'Green'
+    }
+    elseif ($rb) {
+        $problems.Add('Verbose logging is off on the runbook, so every INFO and SUCCESS line ' +
+            'is discarded and the job log will hold only the report rows and any warnings. ' +
+            'Run -Stage Runbook, which switches it on.')
     }
 
     Write-Host ''
@@ -737,7 +753,21 @@ switch ($Stage) {
     'Runbook'  {
         Invoke-RunbookStage
         Write-Host ''
-        Write-Stage 'The runbook is published but has no schedule, so it only runs when you start it.' 'Yellow'
+
+        # Say what is actually true. This line used to claim there was no schedule whatever
+        # the facts were, which reads as a warning that the deployment is unfinished even
+        # when it is fully scheduled.
+        $link = Get-AzAutomationScheduledRunbook @common -ErrorAction SilentlyContinue |
+                Where-Object { $_.RunbookName -eq $RunbookName }
+        if ($link) {
+            foreach ($l in $link) {
+                Write-Stage "The runbook is published and still linked to schedule $($l.ScheduleName)." 'Green'
+            }
+            Write-Stage 'Republishing can recreate that link, so check its parameters with -JobScheduleId.' 'Yellow'
+        }
+        else {
+            Write-Stage 'The runbook is published but has no schedule, so it only runs when you start it.' 'Yellow'
+        }
     }
     'Verify'   { Invoke-VerifyStage | Out-Null }
     'Alert'    { Invoke-AlertStage }
