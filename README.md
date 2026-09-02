@@ -185,10 +185,10 @@ Connect-MgGraph -Scopes "User.Read.All","AuditLog.Read.All","GroupMember.Read.Al
 | `DisableAfterDays` | 90 | Inactive days before an account is disabled |
 | `DeleteAfterDays` | 120 | Inactive days before it is deleted. Must be at least `DisableAfterDays` |
 | `Mode` | `Report` | `Report` or `Enforce` |
-| `MaxDisablesPerRun` | 50 | Per-run cap |
-| `MaxDeletesPerRun` | 50 | Per-run cap |
-| `AbortIfDeleteCandidatesExceed` | 500 | Skip the deletes above this many delete candidates. 0 means no ceiling |
-| `AbortIfDisableCandidatesExceed` | 2000 | Skip the disables above this many disable candidates. 0 means no ceiling |
+| `MaxDisablesPerRun` | sized | Per-run cap. Auto: the larger of 50 and 10% of guests |
+| `MaxDeletesPerRun` | sized | Per-run cap. Auto: the larger of 25 and 2% of guests |
+| `AbortIfDeleteCandidatesExceed` | sized | Skip the deletes above this many delete candidates. Auto: the larger of 50 and 25% of guests |
+| `AbortIfDisableCandidatesExceed` | sized | Skip the disables above this many disable candidates. Auto: no ceiling |
 | `ExcludeGroupId` | none | Group whose members are never touched |
 | `ExcludeDomains` | none | Domains to leave alone |
 | `ExcludeUpn` | none | Individual accounts to leave alone |
@@ -198,6 +198,18 @@ Connect-MgGraph -Scopes "User.Read.All","AuditLog.Read.All","GroupMember.Read.Al
 | `TeamsWebhookUrl` | none | Required by the `Teams` sink. Prefer the Automation variable |
 | `SkipGroupMemberships` | off | Skip the membership lookup on actioned accounts |
 | `ManagedIdentityClientId` | none | Only for a user-assigned managed identity |
+
+**Those four are sized from your directory unless you give a number.** They default to
+`-1`, which means "work it out from the guest count once you have read it". `0` means none
+or zero and is respected as a deliberate instruction. Any value above `0` is used exactly as
+given, so an explicit setting always wins. Every run logs which value it used and whether it
+was sized or supplied.
+
+A fixed default was wrong in both directions, and the two failures look nothing alike. A
+ceiling of 500 never trips in an 80 guest tenant, so there is no protection at all and a
+mass deletion would go through unremarked. The same 500 trips on a perfectly normal backlog
+at 20,000 guests — and because a tripped ceiling drains nothing, the job then never recovers
+without somebody intervening.
 
 `ExcludeGroupId` and `TeamsWebhookUrl` are also read from the Automation Account
 variables `StaleGuest-ExcludeGroupId` and `StaleGuest-TeamsWebhookUrl`, so they can be

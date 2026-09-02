@@ -295,6 +295,82 @@ Describe 'Invoke-StaleGuestCleanup orchestration' {
         }
     }
 
+    Context 'sizing the caps and ceilings from the directory' {
+
+        It 'uses an explicit value unchanged' {
+            Resolve-RunLimit -Value 50 -Percent 25 -Floor 100 -Population 1000 -Name 'x' |
+                Should -Be 50
+        }
+
+        It 'leaves 0 alone, because 0 is a deliberate none rather than an absent value' {
+            Resolve-RunLimit -Value 0 -Percent 25 -Floor 100 -Population 1000 -Name 'x' |
+                Should -Be 0
+        }
+
+        It 'uses the floor in a small directory, where a percentage would protect nothing' {
+            # 25% of 80 is 20. A ceiling of 20 in an 80 guest tenant would trip on any
+            # real backlog, so the floor wins.
+            Resolve-RunLimit -Value -1 -Percent 25 -Floor 50 -Population 80 -Name 'x' |
+                Should -Be 50
+        }
+
+        It 'uses the percentage in a large directory, where a fixed number would trip constantly' {
+            Resolve-RunLimit -Value -1 -Percent 25 -Floor 50 -Population 20000 -Name 'x' |
+                Should -Be 5000
+        }
+
+        It 'sizes to no limit when the percentage and the floor are both zero' {
+            # How the disable ceiling defaults to absent.
+            Resolve-RunLimit -Value -1 -Percent 0 -Floor 0 -Population 20000 -Name 'x' |
+                Should -Be 0
+        }
+
+        It 'rounds up, because a fraction of an account is not a thing' {
+            # 2% of 1051 is 21.02.
+            Resolve-RunLimit -Value -1 -Percent 2 -Floor 0 -Population 1051 -Name 'x' |
+                Should -Be 22
+        }
+
+        It 'sizes the delete cap off the directory when the caller does not give one' {
+            # 30 guests, so 2% is 1 and the floor of 25 wins. All 30 are delete
+            # candidates, so exactly the cap should go.
+            Mock -CommandName Get-GuestUser -MockWith { New-GuestSet -Count 30 -InactiveDays 200 }
+            $d = $script:Defaults.Clone()
+            $d.Remove('MaxDeletesPerRun')
+
+            Invoke-StaleGuestCleanup @d -Mode Enforce -MaxDeletesPerRun (-1)
+
+            $script:Deleted.Count | Should -Be 25
+        }
+
+        It 'sizes the delete ceiling off the directory, so a small tenant is still protected' {
+            # 60 guests, all stale. 25% of 60 is 15, the floor is 50, so the ceiling is 50
+            # and 60 candidates trips it. Under the old fixed default of 500 it never
+             # would have, and the whole directory would have gone.
+            Mock -CommandName Get-GuestUser -MockWith { New-GuestSet -Count 60 -InactiveDays 200 }
+            $d = $script:Defaults.Clone()
+            $d.Remove('AbortIfDeleteCandidatesExceed')
+
+            { Invoke-StaleGuestCleanup @d -Mode Enforce -AbortIfDeleteCandidatesExceed (-1) } |
+                Should -Throw -ExpectedMessage '*above the ceiling*'
+
+            $script:Deleted.Count | Should -Be 0
+        }
+
+        It 'reports the effective values in the summary, not the sentinels' {
+            Mock -CommandName Get-GuestUser -MockWith { New-GuestSet -Count 30 -InactiveDays 200 }
+            Mock -CommandName Write-ReportToJobLog -MockWith { $script:capturedSummary = $Summary }
+            $d = $script:Defaults.Clone()
+            $d.Remove('MaxDeletesPerRun')
+            $d.Remove('MaxDisablesPerRun')
+
+            Invoke-StaleGuestCleanup @d -Mode Report -ReportSink JobLog `
+                -MaxDeletesPerRun (-1) -MaxDisablesPerRun (-1)
+
+            $script:capturedSummary.MaxDeletesPerRun  | Should -Be 25
+            $script:capturedSummary.MaxDisablesPerRun | Should -Be 50
+        }
+    }
     Context 'the abort ceilings' {
 
         It 'freezes the deletes when the delete ceiling is reached, and fails the job' {

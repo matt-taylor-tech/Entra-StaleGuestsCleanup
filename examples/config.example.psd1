@@ -34,18 +34,21 @@
     # Most accounts to act on in one run. The rest wait for the next run, oldest first.
     # Keep these low on a directory that has never been cleaned: the first enforcing
     # run can otherwise action years of accumulated accounts at once.
-    MaxDisablesPerRun = 50
-    MaxDeletesPerRun  = 50
+    # -1 sizes each from the guest count: disables at the larger of 50 and 10%, deletes
+     # at the larger of 25 and 2%. Set a number to override. 0 means do nothing.
+    MaxDisablesPerRun = -1
+    MaxDeletesPerRun  = -1
 
     # Stop the run and change nothing if the candidate count is above this. A number
     # far above your normal run is the point. It catches a bad threshold or a lost
     # permission before either becomes a mass deletion.
     # Deletion is irreversible after 30 days, so keep this tight.
-    AbortIfDeleteCandidatesExceed  = 500
+    # -1 sizes it at the larger of 50 and 25% of guests.
+    AbortIfDeleteCandidatesExceed  = -1
 
     # Loose on purpose. Disabling is reversible and removes access, so blocking it
     # protects nothing and only leaves stale accounts enabled. 0 means no ceiling.
-    AbortIfDisableCandidatesExceed = 2000
+    AbortIfDisableCandidatesExceed = -1
 
     # ----- Exclusions -------------------------------------------------------------
     # Object ID of a group whose members are never touched, nested groups included.
