@@ -72,7 +72,7 @@ removes something it should not have. After 30 days it is gone.
 | Rail | What it does |
 | --- | --- |
 | `-Mode Report` (default) | Evaluates everything, changes nothing |
-| `-WhatIf` | Standard PowerShell dry run, works in enforce mode too |
+| `-WhatIf` | Standard PowerShell dry run, works in enforce mode too. **On a workstation** — see the warning below before relying on it in Azure Automation |
 | `-MaxDisablesPerRun` / `-MaxDeletesPerRun` | Caps one run. Most stale accounts go first, so repeated runs drain the backlog oldest first |
 | `-AbortIfDeleteCandidatesExceed` | Skips the deletes when the delete candidate count is unexpectedly high. The disables still run |
 | `-AbortIfDisableCandidatesExceed` | Skips the disables when the disable candidate count is unexpectedly high. Deliberately loose |
@@ -98,6 +98,24 @@ the delete threshold, so it is disabled while it waits. Before that, accounts pa
 delete threshold were the only ones that never got the safe reversible action, because
 delete is tested before disable. On a large backlog that left hundreds of the most stale
 accounts in the directory enabled for months.
+
+> [!WARNING]
+> **Do not rely on `-WhatIf` for a dry run in Azure Automation.** `WhatIf` comes from
+> `CmdletBinding`, so it is a common parameter rather than one this script declares, and
+> `Start-AzAutomationRunbook -Parameters` maps to declared parameters. If it is silently
+> ignored you get a real Enforce run, which is the one mistake you cannot take back.
+>
+> Bound the run with declared parameters instead, which Automation certainly honours:
+>
+> ```powershell
+> # Prove the disable path. Physically cannot delete anything.
+> -Parameters @{ Mode = 'Enforce'; MaxDeletesPerRun = 0; MaxDisablesPerRun = 2 }
+>
+> # Then prove the delete path. Exactly one account, restorable for 30 days.
+> -Parameters @{ Mode = 'Enforce'; MaxDeletesPerRun = 1; MaxDisablesPerRun = 0 }
+> ```
+>
+> `-WhatIf` is still the right tool when you run the script on a workstation.
 
 ## Quick start
 
@@ -184,6 +202,16 @@ Connect-MgGraph -Scopes "User.Read.All","AuditLog.Read.All","GroupMember.Read.Al
 `ExcludeGroupId` and `TeamsWebhookUrl` are also read from the Automation Account
 variables `StaleGuest-ExcludeGroupId` and `StaleGuest-TeamsWebhookUrl`, so they can be
 changed without republishing. A parameter passed on the command line always wins.
+
+> [!IMPORTANT]
+> **Set `ExcludeGroupId` as the Automation variable, not only as a schedule parameter.**
+> A schedule parameter applies to that schedule and nothing else. Start the runbook by hand
+> from the Azure portal, accept the defaults, and the parameter is absent — so **no
+> exclusions are applied at all**, silently, with no mention of the exclusion group in the
+> job log. The variable applies to every run, scheduled or manual.
+>
+> The absence is the tell. A run that read an exclusion group logs
+> `Exclusion group holds N members`. No such line means nothing was excluded.
 
 ## Permissions
 

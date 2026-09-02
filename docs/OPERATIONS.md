@@ -63,7 +63,7 @@ The columns worth reading:
 | `Basis` | `LastSignIn` means the guest signed in at least once. `NeverSignedIn` means the clock ran from the creation date. `Indeterminate` means there was not enough data and the account was left alone |
 | `InactiveDays` | How the decision was reached. Cross-check it against `LastActivityDate` |
 | `Action` | What was decided |
-| `Outcome` | What actually happened. `Deleted`, `Disabled`, `Report only, not applied`, `Deferred by the per-run cap`, `Aborted`, `Skipped by WhatIf`, or a failure message |
+| `Outcome` | What actually happened. One of `Deleted`, `Disabled`, `Disabled while waiting to be deleted`, `Report only, not applied`, `Deferred by the per-run cap`, `Not deleted, delete ceiling reached`, `Not disabled, disable ceiling reached`, `Skipped by WhatIf`, or a failure message |
 | `Memberships` | Groups and Teams the account belonged to. Read before the delete, because afterwards there is nothing to read. This is the record of what access was removed |
 | `Reason` | Why. Includes the exclusion reason when an account was skipped |
 
