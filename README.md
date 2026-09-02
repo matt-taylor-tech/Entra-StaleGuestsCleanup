@@ -64,6 +64,33 @@ of in one run.
 defaults are a starting point, not a recommendation. A guest account is somebody's
 customer or supplier contact.
 
+**Set the disable threshold above how often your guests actually need to sign in.** This is
+the trap that catches people, and it is not obvious. If your guests are customers who open a
+Power BI report or a shared file *quarterly*, their normal sign-in gap is about 90 days — so
+a 90 day disable threshold locks them out between legitimate visits, and a 125 day delete
+threshold removes them before the next one. An active guest is always safe, because every
+visit resets the clock. The population at risk is the infrequent but entirely legitimate
+user, which is exactly who a customer-facing report has.
+
+Work out the longest gap a valid user could leave, then set the disable threshold beyond it.
+One real deployment moved from 90/125 to 120/210 for this reason.
+
+**The report tells you which risk you are actually carrying.** Split the delete queue by the
+`Basis` column:
+
+| `Basis` | What it means | How much care it needs |
+| --- | --- | --- |
+| `NeverSignedIn` | The invitation was never accepted. Nobody has ever used it | Little. Deleting it takes nothing away |
+| `LastSignIn` | A real person used this and went quiet | This is where a wrong threshold does damage |
+
+On one tenant a queue of 374 split as 164 `NeverSignedIn` and 209 `LastSignIn`, and of those
+209 only 48 were in the risky 125 to 180 day band while 91 were over a year stale. Those are
+very different decisions, and one number hides both.
+
+Exclusions are not the answer to this. A group of report consumers, or a partner domain, will
+happily keep a departed contact exempt forever — the same reason group membership is not
+evidence of use. Thresholds are the right lever.
+
 **A deleted Entra user is restorable for 30 days.** That is the recovery path if this job
 removes something it should not have. After 30 days it is gone.
 

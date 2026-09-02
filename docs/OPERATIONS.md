@@ -171,6 +171,27 @@ The runbook throws, and so produces a failed job, when:
 - the sign-in data is unusable,
 - either candidate count is above its own abort ceiling.
 
+## The audit log may show failures the job reports as zero
+
+The Entra directory audit log records every attempt. The job records outcomes after retries.
+So a run that reports `Failures: 0` can still leave failed events in the audit log, and that
+is not a contradiction.
+
+Seen in practice: a run disabled 451 accounts and reported no failures, while the audit log
+held 451 successes **and** 3 failures with `Microsoft.Online.WriteOperationsBlockedException`.
+The three were transient tenant write blocks. The retry wrapper tried again and succeeded, so
+454 attempts produced 451 disabled accounts.
+
+The arithmetic is how you tell the two cases apart:
+
+- **successes equal the number the job intended** — every account was actioned, and the
+  failures were retried attempts. Nothing to do.
+- **successes fall short of what the job intended** — accounts really were missed, and the
+  job should have counted them under `Failures`. Worth investigating.
+
+If you want to confirm a specific account, read it back rather than counting events:
+`accountEnabled` false for a disable, or presence in `directory/deletedItems` for a delete.
+
 ## Sizing the delete cap
 
 Size `MaxDeletesPerRun` against how fast accounts **age in**, not just against the backlog
