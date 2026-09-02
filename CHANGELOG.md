@@ -9,6 +9,27 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed - BREAKING
 
+**The per-run caps and both abort ceilings are now sized from the guest count.** All four
+default to `-1`, meaning "work it out from the directory". `0` still means none or zero.
+Any value above `0` is used exactly as given, so an explicit setting always wins. Every run
+logs which value it used and whether it was sized or supplied.
+
+| Setting | Sized as |
+|---|---|
+| `MaxDisablesPerRun` | larger of 50 and 10% of guests |
+| `MaxDeletesPerRun` | larger of 25 and 2% of guests |
+| `AbortIfDeleteCandidatesExceed` | larger of 50 and 25% of guests |
+| `AbortIfDisableCandidatesExceed` | no ceiling |
+
+A fixed default was wrong in both directions, and the two failures look nothing alike. A
+ceiling of 500 never trips in an 80 guest tenant, so there is no protection at all and a
+mass deletion goes through unremarked. The same 500 trips on a normal backlog at 20,000
+guests, and because a tripped ceiling drains nothing the job then never recovers. The caps
+are the same story: 50 deletes a run is glacial at 20,000 guests and reckless at 80.
+
+Anyone relying on the old fixed defaults of 50, 50, 500 and 2000 should set them
+explicitly.
+
 `AbortIfCandidatesExceed` is replaced by `AbortIfDeleteCandidatesExceed` (default 500)
 and `AbortIfDisableCandidatesExceed` (default 2000). Anyone passing the old parameter
 must rename it. **This warrants a 2.0.0 release.**

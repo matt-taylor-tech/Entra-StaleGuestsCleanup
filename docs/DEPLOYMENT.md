@@ -103,6 +103,10 @@ ID as an Automation variable. The runbook reads that variable on its own.
 ```powershell
 New-AzAutomationVariable -ResourceGroupName "<rg>" -AutomationAccountName "<aa>" `
     -Name "StaleGuest-ExcludeGroupId" -Value "<group-object-id>" -Encrypted $false
+
+Set the variable even if you also pass `-ExcludeGroupId` on the schedule. A schedule
+parameter covers that schedule only, so a run started by hand from the portal would
+apply no exclusions at all. The variable covers every run.
 ```
 
 Use a group rather than a parameter list, so adding an exception later needs no

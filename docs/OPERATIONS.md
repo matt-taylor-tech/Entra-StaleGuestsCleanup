@@ -63,7 +63,7 @@ The columns worth reading:
 | `Basis` | `LastSignIn` means the guest signed in at least once. `NeverSignedIn` means the clock ran from the creation date. `Indeterminate` means there was not enough data and the account was left alone |
 | `InactiveDays` | How the decision was reached. Cross-check it against `LastActivityDate` |
 | `Action` | What was decided |
-| `Outcome` | What actually happened. `Deleted`, `Disabled`, `Report only, not applied`, `Deferred by the per-run cap`, `Aborted`, `Skipped by WhatIf`, or a failure message |
+| `Outcome` | What actually happened. One of `Deleted`, `Disabled`, `Disabled while waiting to be deleted`, `Report only, not applied`, `Deferred by the per-run cap`, `Not deleted, delete ceiling reached`, `Not disabled, disable ceiling reached`, `Skipped by WhatIf`, or a failure message |
 | `Memberships` | Groups and Teams the account belonged to. Read before the delete, because afterwards there is nothing to read. This is the record of what access was removed |
 | `Reason` | Why. Includes the exclusion reason when an account was skipped |
 
@@ -170,6 +170,29 @@ The runbook throws, and so produces a failed job, when:
 - an account operation fails,
 - the sign-in data is unusable,
 - either candidate count is above its own abort ceiling.
+
+## Sizing the delete cap
+
+Size `MaxDeletesPerRun` against how fast accounts **age in**, not just against the backlog
+you can see today. This is the trap:
+
+- The cap limits how many you remove per run.
+- Accounts keep crossing the delete threshold between runs.
+- If the cap is below that inflow, the queue **grows** every run.
+- A growing queue eventually crosses the delete ceiling, and then deletes freeze entirely.
+
+Worked example from a real tenant of about 1,100 guests, a fortnightly schedule and a cap
+of 50: the queue never fell below 340 for a year, grew through two months when a large
+cohort aged in, and peaked at 668 against a ceiling of 700. Thirty-two of headroom. Raising
+the cap to 150 kept the queue under 270 throughout and removed the collision.
+
+Two things worth knowing before you reach for a bigger number:
+
+- **Above a certain point a larger cap buys no time.** The finish date is governed by when
+  the last account crosses the threshold, not by how fast you delete. Past that point a
+  bigger cap only shrinks the standing queue.
+- **The queue is not an exposure.** Anything waiting to be deleted has already been
+  disabled, so the access is gone. A long deletion tail is untidy, not risky.
 
 So all three reach the alert. A run that finds nothing to do completes quietly.
 

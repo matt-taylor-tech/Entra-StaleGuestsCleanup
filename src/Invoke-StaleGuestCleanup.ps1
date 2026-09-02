@@ -61,21 +61,24 @@ param(
     [string]$Mode = 'Report',
 
     # Most accounts to disable in a single run. The rest are logged as deferred.
+    # -1 sizes it from the guest count, 0 disables nothing, above 0 is exact.
     [Parameter(Mandatory = $false)]
-    [ValidateRange(0, 100000)]
-    [int]$MaxDisablesPerRun = 50,
+    [ValidateRange(-1, 100000)]
+    [int]$MaxDisablesPerRun = -1,
 
     # Most accounts to delete in a single run. The rest are logged as deferred.
+    # -1 sizes it from the guest count, 0 deletes nothing, above 0 is exact.
     [Parameter(Mandatory = $false)]
-    [ValidateRange(0, 100000)]
-    [int]$MaxDeletesPerRun = 50,
+    [ValidateRange(-1, 100000)]
+    [int]$MaxDeletesPerRun = -1,
 
-    # Skip the DELETES if the delete candidate count is above this. 0 means no ceiling.
+    # Skip the DELETES if the delete candidate count is above this.
+    # -1 sizes it from the guest count, 0 means no ceiling, above 0 is exact.
     # Guards against a filter or permission change that makes everything look stale.
     # Deletion is only reversible for 30 days, so this ceiling is deliberately tight.
     [Parameter(Mandatory = $false)]
-    [ValidateRange(0, 1000000)]
-    [int]$AbortIfDeleteCandidatesExceed = 500,
+    [ValidateRange(-1, 1000000)]
+    [int]$AbortIfDeleteCandidatesExceed = -1,
 
     # Skip the DISABLES if the disable candidate count is above this. 0 means no ceiling.
     #
@@ -84,9 +87,10 @@ param(
     # missing, and a filter change - are already caught by the null sign-in guard and by
     # the delete ceiling. Blocking disables protects nothing: it only leaves stale
     # accounts enabled.
+    # -1 sizes it from the guest count, which means no ceiling. 0 also means no ceiling.
     [Parameter(Mandatory = $false)]
-    [ValidateRange(0, 1000000)]
-    [int]$AbortIfDisableCandidatesExceed = 2000,
+    [ValidateRange(-1, 1000000)]
+    [int]$AbortIfDisableCandidatesExceed = -1,
 
     # ----- Exclusions -------------------------------------------------------------------
     # Object ID of a group whose members are never touched. Nested groups are honoured.
@@ -311,6 +315,48 @@ function ConvertTo-GuestRecord {
         LastNonInteractiveSignIn    = ConvertTo-NullableUtc (Get-GraphProperty $activity 'lastNonInteractiveSignInDateTime')
         LastSuccessfulSignIn        = ConvertTo-NullableUtc (Get-GraphProperty $activity 'lastSuccessfulSignInDateTime')
     }
+}
+
+function Resolve-RunLimit {
+    <#
+        Turns -1 into a number sized from the directory it is about to act on.
+
+        A fixed default is wrong in both directions, and the two failures look nothing alike.
+        A ceiling of 500 never trips in an 80 guest tenant, so there is no protection at all
+        and a mass deletion would go through unremarked. The same 500 trips on a perfectly
+        normal backlog at 20,000 guests, and because a tripped ceiling drains nothing the
+        job then never recovers. The caps are the same story: 50 deletes a run is glacial at
+        20,000 guests and reckless at 80.
+
+        -1 sizes from the guest count. 0 means none or zero and is left alone, because it is
+        a deliberate instruction rather than an absent one. Anything above 0 is used as
+        given, so an explicit value always wins.
+
+        Rounds up. A fraction of an account is not a thing.
+    #>
+    param(
+        [Parameter(Mandatory = $true)] [int]$Value,
+        [Parameter(Mandatory = $true)] [int]$Percent,
+        [Parameter(Mandatory = $true)] [int]$Floor,
+        [Parameter(Mandatory = $true)] [int]$Population,
+        [Parameter(Mandatory = $true)] [string]$Name
+    )
+
+    if ($Value -ge 0) {
+        Write-Log "$Name = $Value, as given."
+        return $Value
+    }
+
+    $sized = [math]::Max($Floor, [int][math]::Ceiling($Population * $Percent / 100.0))
+
+    if ($sized -eq 0) {
+        Write-Log "$Name sized from the directory: no limit."
+    }
+    else {
+        Write-Log "$Name sized from the directory: $sized, the larger of $Floor and $Percent% of $Population guests."
+    }
+
+    return $sized
 }
 
 function Get-GuestLastActivity {
@@ -1187,6 +1233,28 @@ function Invoke-StaleGuestCleanup {
         throw $reason
     }
 
+    # ----- Size the caps and ceilings -------------------------------------------------
+    #
+    # Done here rather than in the param block, because it needs the guest count. Assigning
+    # back over the parameters keeps every use below reading the effective value, so there
+    # is no second set of names to keep in step.
+    $population = $records.Count
+
+    $MaxDisablesPerRun = Resolve-RunLimit -Value $MaxDisablesPerRun -Percent 10 -Floor 50 `
+        -Population $population -Name 'MaxDisablesPerRun'
+
+    $MaxDeletesPerRun = Resolve-RunLimit -Value $MaxDeletesPerRun -Percent 2 -Floor 25 `
+        -Population $population -Name 'MaxDeletesPerRun'
+
+    $AbortIfDeleteCandidatesExceed = Resolve-RunLimit -Value $AbortIfDeleteCandidatesExceed `
+        -Percent 25 -Floor 50 -Population $population -Name 'AbortIfDeleteCandidatesExceed'
+
+    # No ceiling by default. Disabling is reversible and removes access, and the two things
+    # a ceiling exists to catch are already caught by the null sign-in guard and by the
+    # delete ceiling. Blocking disables protects nothing: it leaves stale accounts enabled.
+    $AbortIfDisableCandidatesExceed = Resolve-RunLimit -Value $AbortIfDisableCandidatesExceed `
+        -Percent 0 -Floor 0 -Population $population -Name 'AbortIfDisableCandidatesExceed'
+
     # ----- Build the exclusion sets ---------------------------------------------------
     $roleHolders  = Get-DirectoryRoleHolderId
     $excludedIds  = Get-ExclusionGroupMemberId -GroupId $ExcludeGroupId
@@ -1433,6 +1501,10 @@ function Invoke-StaleGuestCleanup {
         Mode              = $Mode
         DisableAfterDays  = $DisableAfterDays
         DeleteAfterDays   = $DeleteAfterDays
+        MaxDisablesPerRun = $MaxDisablesPerRun
+        MaxDeletesPerRun  = $MaxDeletesPerRun
+        DeleteCeiling     = $AbortIfDeleteCandidatesExceed
+        DisableCeiling    = $AbortIfDisableCandidatesExceed
         TotalGuests       = $rows.Count
         Excluded          = $excludedCount
         DisableCandidates = $disableCandidate.Count
